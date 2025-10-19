@@ -145,6 +145,7 @@ BEGIN
   REFRESH MATERIALIZED VIEW CONCURRENTLY charlie.label_distribution;
   REFRESH MATERIALIZED VIEW CONCURRENTLY charlie.source_summary;
   REFRESH MATERIALIZED VIEW CONCURRENTLY charlie.pipeline_run_summary;
+  REFRESH MATERIALIZED VIEW CONCURRENTLY charlie.data_quality_summary;
 END;
 \$\$ LANGUAGE plpgsql;
 

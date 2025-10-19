@@ -35,6 +35,11 @@ try:
 except ImportError:
     OpenAI = None
 
+try:
+    from anthropic import Anthropic
+except ImportError:
+    Anthropic = None
+
 logger = logging.getLogger("charlie")
 
 # -------------------------
@@ -486,38 +491,221 @@ def fetch_simfin_fundamentals(ticker: str, start_date: date, api_key: str) -> Li
         logger.error(f"SimFin fundamentals fetch failed for {ticker}: {e}")
         return []
 
-# LLM distillation with OpenAI
-def run_llm_distillation_batch(prompts: List[Dict[str, Any]], llm_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+# -------------------------
+# M3: Additional modality fetchers (Insider, Analyst, SEC)
+# -------------------------
+
+@tenacity_retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> List[Dict[str, Any]]:
     """
-    Generate investment theses using OpenAI API.
-    prompts: list of {"sample_id": int, "prompt_text": str}
-    returns: list of {"sample_id": int, "thesis_text": str, "thesis_structure": dict}
+    Fetch insider trading transactions from FMP API.
+    Returns list of insider transactions up to as_of_date.
     """
-    if OpenAI is None or not llm_config.get("api_key"):
-        logger.warning("OpenAI not available or API key not configured - returning stub theses")
-        outputs = []
-        for p in prompts:
-            outputs.append({
-                "sample_id": p["sample_id"],
-                "thesis_text": f"LLM distillation skipped (OpenAI not configured)",
-                "thesis_structure": {"claims": [], "evidence": [], "summary": "stub"},
-            })
-        return outputs
+    if not api_key:
+        logger.debug(f"FMP API key not configured, skipping insider transactions for {ticker}")
+        return []
 
     try:
-        client = OpenAI(api_key=llm_config["api_key"])
-        model = llm_config.get("model", "gpt-4o-mini")
+        logger.debug(f"Fetching insider transactions for {ticker} up to {as_of_date}")
 
-        logger.info(f"Running LLM distillation for {len(prompts)} samples using {model}")
+        url = f"https://financialmodelingprep.com/api/v4/insider-trading"
+        params = {
+            "symbol": ticker,
+            "apikey": api_key,
+            "limit": 50  # Get last 50 transactions
+        }
 
-        outputs = []
-        for idx, p in enumerate(prompts):
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
+
+        results = []
+        for txn in data:
+            filing_date_str = txn.get('filingDate')
+            if not filing_date_str:
+                continue
+
+            # Parse filing date and filter by as_of_date
             try:
-                sample_id = p["sample_id"]
-                prompt_text = p["prompt_text"]
+                filing_date = datetime.strptime(filing_date_str.split('T')[0], '%Y-%m-%d').date()
+                if filing_date > as_of_date:
+                    continue  # Skip future transactions
+            except:
+                continue
 
-                # Create structured prompt for investment thesis generation
-                system_prompt = """You are a financial analyst generating concise investment theses.
+            results.append({
+                "filing_date": filing_date_str.split('T')[0],
+                "transaction_type": txn.get('transactionType', ''),
+                "shares": txn.get('securitiesTransacted', 0),
+                "amount": txn.get('securitiesOwned', 0),  # Post-transaction ownership
+                "mspr": txn.get('pricePerShare', 0),  # Price per share
+                "owner": txn.get('reportingName', ''),
+                "raw_json": txn
+            })
+
+        logger.info(f"Fetched {len(results)} insider transactions from FMP for {ticker}")
+        return results
+
+    except Exception as e:
+        logger.error(f"FMP insider transactions fetch failed for {ticker}: {e}")
+        return []
+
+@tenacity_retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_analyst_recommendations(ticker: str, as_of_date: date, api_key: str) -> List[Dict[str, Any]]:
+    """
+    Fetch analyst recommendations from FMP API.
+    Returns list of analyst ratings up to as_of_date.
+    """
+    if not api_key:
+        logger.debug(f"FMP API key not configured, skipping analyst recommendations for {ticker}")
+        return []
+
+    try:
+        logger.debug(f"Fetching analyst recommendations for {ticker} up to {as_of_date}")
+
+        url = f"https://financialmodelingprep.com/api/v3/grade/{ticker}"
+        params = {
+            "apikey": api_key,
+            "limit": 20
+        }
+
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
+
+        results = []
+        for reco in data:
+            reco_date_str = reco.get('date')
+            if not reco_date_str:
+                continue
+
+            # Parse date and filter by as_of_date
+            try:
+                reco_date = datetime.strptime(reco_date_str.split('T')[0], '%Y-%m-%d').date()
+                if reco_date > as_of_date:
+                    continue  # Skip future recommendations
+            except:
+                continue
+
+            results.append({
+                "reco_date": reco_date_str.split('T')[0],
+                "consensus_rating": reco.get('newGrade', ''),
+                "previous_rating": reco.get('previousGrade', ''),
+                "firm": reco.get('gradingCompany', ''),
+                "action": reco.get('action', ''),  # upgrade, downgrade, init, reiterate
+                "raw_json": reco
+            })
+
+        logger.info(f"Fetched {len(results)} analyst recommendations from FMP for {ticker}")
+        return results
+
+    except Exception as e:
+        logger.error(f"FMP analyst recommendations fetch failed for {ticker}: {e}")
+        return []
+
+@tenacity_retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def fetch_edgar_filings(ticker: str, as_of_date: date) -> List[Dict[str, Any]]:
+    """
+    Fetch SEC EDGAR filings (10-Q, 10-K) for the ticker up to as_of_date.
+    This is a STUB implementation using SEC EDGAR RSS/API.
+
+    NOTE: Full implementation would require parsing CIK, querying SEC EDGAR API,
+    and extracting filing metadata. This stub returns an empty list with logging.
+    """
+    try:
+        logger.info(f"SEC EDGAR filings fetch is STUBBED for {ticker} (as_of_date={as_of_date})")
+        logger.info("To implement: Query https://www.sec.gov/cgi-bin/browse-edgar with CIK and parse filings")
+
+        # TODO: Implement full SEC EDGAR integration
+        # 1. Map ticker to CIK (Central Index Key)
+        # 2. Query SEC EDGAR API: https://data.sec.gov/submissions/CIK{cik}.json
+        # 3. Parse recent filings (10-Q, 10-K, 8-K)
+        # 4. Extract filing dates, URLs, and metadata
+        # 5. Filter by as_of_date
+
+        return []
+
+    except Exception as e:
+        logger.error(f"SEC EDGAR filings fetch failed for {ticker}: {e}")
+        return []
+
+# -------------------------
+# M4: LLM distillation with OpenAI and Claude fallback
+# -------------------------
+def run_llm_distillation_batch(prompts: List[Dict[str, Any]], llm_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Generate investment theses using LLM APIs with fallback support.
+    Tries OpenAI first, falls back to Claude if OpenAI fails.
+
+    prompts: list of {"sample_id": int, "prompt_text": str}
+    llm_config: {
+        "api_key": str (OpenAI key),
+        "anthropic_api_key": str (Claude key),
+        "model": str,
+        "fallback_to_claude": bool
+    }
+    returns: list of {"sample_id": int, "thesis_text": str, "thesis_structure": dict}
+    """
+    # Check availability
+    openai_available = OpenAI is not None and llm_config.get("api_key")
+    claude_available = Anthropic is not None and llm_config.get("anthropic_api_key")
+
+    if not openai_available and not claude_available:
+        logger.warning("No LLM providers available - returning stub theses")
+        return _generate_stub_theses(prompts)
+
+    # Try OpenAI first
+    if openai_available:
+        try:
+            return _distill_with_openai(prompts, llm_config)
+        except Exception as e:
+            logger.error(f"OpenAI distillation failed: {e}")
+            if claude_available and llm_config.get("fallback_to_claude", True):
+                logger.info("Falling back to Claude for distillation")
+                try:
+                    return _distill_with_claude(prompts, llm_config)
+                except Exception as e2:
+                    logger.error(f"Claude fallback also failed: {e2}")
+                    return _generate_stub_theses(prompts, error=f"Both providers failed: OpenAI={e}, Claude={e2}")
+            else:
+                return _generate_stub_theses(prompts, error=str(e))
+
+    # If OpenAI not available but Claude is, use Claude directly
+    if claude_available:
+        try:
+            return _distill_with_claude(prompts, llm_config)
+        except Exception as e:
+            logger.error(f"Claude distillation failed: {e}")
+            return _generate_stub_theses(prompts, error=str(e))
+
+    return _generate_stub_theses(prompts)
+
+def _generate_stub_theses(prompts: List[Dict[str, Any]], error: str = "LLM not configured") -> List[Dict[str, Any]]:
+    """Generate stub thesis outputs when LLM is unavailable"""
+    return [{
+        "sample_id": p["sample_id"],
+        "thesis_text": f"LLM distillation skipped: {error}",
+        "thesis_structure": {"error": error, "summary": "stub"},
+    } for p in prompts]
+
+def _distill_with_openai(prompts: List[Dict[str, Any]], llm_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Distill theses using OpenAI API"""
+    client = OpenAI(api_key=llm_config["api_key"])
+    model = llm_config.get("model", "gpt-4o-mini")
+
+    logger.info(f"Running OpenAI distillation for {len(prompts)} samples using {model}")
+
+    outputs = []
+    for idx, p in enumerate(prompts):
+        try:
+            sample_id = p["sample_id"]
+            prompt_text = p["prompt_text"]
+
+            system_prompt = """You are a financial analyst generating concise investment theses.
 Analyze the provided data and generate a structured investment thesis with:
 1. Executive Summary (2-3 sentences)
 2. Key Claims (3-5 bullet points)
@@ -527,65 +715,138 @@ Analyze the provided data and generate a structured investment thesis with:
 
 Keep the response focused and data-driven."""
 
-                user_prompt = f"""Based on the following financial data, generate an investment thesis:
+            user_prompt = f"""Based on the following financial data, generate an investment thesis:
 
 {prompt_text}
 
 Provide a structured analysis following the format specified."""
 
-                logger.debug(f"Generating thesis for sample {sample_id} ({idx+1}/{len(prompts)})")
+            logger.debug(f"Generating thesis {idx+1}/{len(prompts)} for sample {sample_id}")
 
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.7,
-                    max_tokens=1000
-                )
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.7,
+                max_tokens=1000
+            )
 
-                thesis_text = response.choices[0].message.content
+            thesis_text = response.choices[0].message.content
+            tokens_used = response.usage.total_tokens if hasattr(response, 'usage') else 0
 
-                # Parse structure from the response (simple extraction)
-                lines = thesis_text.split('\n')
-                claims = [line.strip('- ') for line in lines if line.strip().startswith('-')]
+            thesis_structure = _parse_thesis_structure(thesis_text, model, tokens_used)
 
-                thesis_structure = {
-                    "claims": claims[:5] if claims else [],
-                    "evidence": [],  # Could enhance with regex extraction
-                    "summary": thesis_text.split('\n')[0] if thesis_text else "No summary",
-                    "model": model,
-                    "tokens_used": response.usage.total_tokens if hasattr(response, 'usage') else 0
-                }
+            outputs.append({
+                "sample_id": sample_id,
+                "thesis_text": thesis_text,
+                "thesis_structure": thesis_structure
+            })
 
-                outputs.append({
-                    "sample_id": sample_id,
-                    "thesis_text": thesis_text,
-                    "thesis_structure": thesis_structure
-                })
+            logger.info(f"Generated thesis for sample {sample_id} ({len(thesis_text)} chars, {tokens_used} tokens)")
+            time.sleep(0.5)  # Rate limiting
 
-                logger.info(f"Generated thesis for sample {sample_id} ({len(thesis_text)} chars)")
+        except Exception as e:
+            logger.error(f"OpenAI call failed for sample {p.get('sample_id')}: {e}")
+            outputs.append({
+                "sample_id": p.get("sample_id"),
+                "thesis_text": f"Error: {str(e)}",
+                "thesis_structure": {"error": str(e)}
+            })
 
-                # Rate limiting
-                time.sleep(0.5)
+    return outputs
 
-            except Exception as e:
-                logger.error(f"Failed to generate thesis for sample {p.get('sample_id')}: {e}")
-                outputs.append({
-                    "sample_id": p.get("sample_id"),
-                    "thesis_text": f"Error generating thesis: {str(e)}",
-                    "thesis_structure": {"error": str(e)}
-                })
+def _distill_with_claude(prompts: List[Dict[str, Any]], llm_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Distill theses using Anthropic Claude API"""
+    client = Anthropic(api_key=llm_config["anthropic_api_key"])
+    model = llm_config.get("claude_model", "claude-3-5-sonnet-20241022")
 
-        logger.info(f"Completed LLM distillation batch: {len(outputs)} theses generated")
-        return outputs
+    logger.info(f"Running Claude distillation for {len(prompts)} samples using {model}")
 
-    except Exception as e:
-        logger.error(f"LLM distillation batch failed: {e}")
-        # Return stub outputs on complete failure
-        return [{
-            "sample_id": p["sample_id"],
-            "thesis_text": f"LLM error: {str(e)}",
-            "thesis_structure": {"error": str(e)}
-        } for p in prompts]
+    outputs = []
+    for idx, p in enumerate(prompts):
+        try:
+            sample_id = p["sample_id"]
+            prompt_text = p["prompt_text"]
+
+            system_prompt = """You are a financial analyst generating concise investment theses.
+Analyze the provided data and generate a structured investment thesis with:
+1. Executive Summary (2-3 sentences)
+2. Key Claims (3-5 bullet points)
+3. Supporting Evidence (cite specific data points)
+4. Risk Factors (2-3 key risks)
+5. Outlook (bullish/bearish/neutral with brief justification)
+
+Keep the response focused and data-driven."""
+
+            user_prompt = f"""Based on the following financial data, generate an investment thesis:
+
+{prompt_text}
+
+Provide a structured analysis following the format specified."""
+
+            logger.debug(f"Generating thesis {idx+1}/{len(prompts)} for sample {sample_id}")
+
+            response = client.messages.create(
+                model=model,
+                max_tokens=1000,
+                temperature=0.7,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+
+            thesis_text = response.content[0].text
+            tokens_used = response.usage.input_tokens + response.usage.output_tokens if hasattr(response, 'usage') else 0
+
+            thesis_structure = _parse_thesis_structure(thesis_text, model, tokens_used)
+
+            outputs.append({
+                "sample_id": sample_id,
+                "thesis_text": thesis_text,
+                "thesis_structure": thesis_structure
+            })
+
+            logger.info(f"Generated thesis for sample {sample_id} ({len(thesis_text)} chars, {tokens_used} tokens)")
+            time.sleep(0.5)  # Rate limiting
+
+        except Exception as e:
+            logger.error(f"Claude call failed for sample {p.get('sample_id')}: {e}")
+            outputs.append({
+                "sample_id": p.get("sample_id"),
+                "thesis_text": f"Error: {str(e)}",
+                "thesis_structure": {"error": str(e)}
+            })
+
+    return outputs
+
+def _parse_thesis_structure(thesis_text: str, model: str, tokens_used: int) -> Dict[str, Any]:
+    """Parse structured information from thesis text"""
+    lines = thesis_text.split('\n')
+    claims = [line.strip('- ') for line in lines if line.strip().startswith('-')]
+
+    # Extract sections (simple heuristic)
+    summary = ""
+    evidence = []
+    risks = []
+
+    for i, line in enumerate(lines):
+        if 'summary' in line.lower() and i + 1 < len(lines):
+            summary = lines[i + 1].strip()
+        elif 'evidence' in line.lower() or 'supporting' in line.lower():
+            # Collect next few lines
+            evidence = [l.strip('- ') for l in lines[i+1:i+4] if l.strip().startswith('-')]
+        elif 'risk' in line.lower():
+            risks = [l.strip('- ') for l in lines[i+1:i+3] if l.strip().startswith('-')]
+
+    return {
+        "summary": summary or (lines[0] if lines else "No summary"),
+        "claims": claims[:5] if claims else [],
+        "evidence": evidence[:3] if evidence else [],
+        "risks": risks[:3] if risks else [],
+        "model": model,
+        "tokens_used": tokens_used,
+        "version": "v2_structured"
+    }
