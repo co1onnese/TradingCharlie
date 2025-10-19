@@ -180,7 +180,7 @@ class S3Storage(StorageBackend):
 
 # Choose backend
 if CONFIG["STORAGE_BACKEND"] == "s3":
-    storage = S3Storage(bucket=os.environ.get("TAURIC_S3_BUCKET", "tauric-data"))
+    storage = S3Storage(bucket=os.environ.get("CHARLIE_S3_BUCKET", "charlie-data"))
 else:
     storage = LocalStorage(CONFIG["DATA_ROOT"])
 

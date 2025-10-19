@@ -85,7 +85,7 @@ class CharlieTR1Pipeline(FlowSpec):
         # Note: Don't store db_engine as instance variable - SQLAlchemy engines can't be pickled by Metaflow
         db_engine = get_db_engine()
         self.run_meta = {
-            "run_name": f"tauric_run_{uuid.uuid4().hex[:8]}",
+            "run_name": f"charlie_run_{uuid.uuid4().hex[:8]}",
             "run_type": "full_backfill" if len(self.date_list) > 1 else "single_date",
             "started_at": datetime.utcnow(),
             "finished_at": None,
@@ -609,7 +609,7 @@ class CharlieTR1Pipeline(FlowSpec):
             # Partition by ticker for easy consumption
             out_dir = Path(self.exports_dir) / ticker
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"tauric_export_{ticker}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.parquet"
+            out_path = out_dir / f"charlie_export_{ticker}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.parquet"
             df.to_parquet(str(out_path), index=False)
             logger.info(f"Wrote export parquet for {ticker} to {out_path}")
             # update run artifacts map
@@ -648,7 +648,7 @@ class CharlieTR1Pipeline(FlowSpec):
         if not run_meta:
             # Initialize if not found (shouldn't happen, but be defensive)
             run_meta = {
-                "run_name": f"tauric_run_{current.run_id}",
+                "run_name": f"charlie_run_{current.run_id}",
                 "started_at": datetime.utcnow(),
                 "status": "success",
                 "artifacts": {},

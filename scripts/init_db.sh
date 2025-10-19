@@ -1,6 +1,6 @@
 #!/bin/bash
-# Database initialization script for Tauric-TR1-DB
-# This script initializes the PostgreSQL database schema with all required tables, indexes, and optimizations
+# Database initialization script for Charlie-TR1-DB
+# This script initializes the PostgreSQL database schema with all required tables, indexes, and optimizationsns
 
 set -e
 

@@ -1,0 +1,11 @@
+{
+  "news": {"count": 10, "sources": ["finnhub", "google_news"]},
+  "news_alt": {"count": 4, "sources": ["gdelt", "newsapi"]},
+  "technicals": {"window_days": 15, "indicators": ["RSI", "MACD", "EMA", "ATR"]},
+  "fundamentals": {"sources": ["simfin", "fmp"], "latest_report": "2024-12-31"},
+  "macro": {"sources": ["fred", "eodhd"], "series_included": ["CPI", "GDP", "FEDFUNDS"]},
+  "insider": {"transactions": 12, "mspr": 0.34},
+  "analyst": {"count": 8, "mean_rating": "Buy"},
+  "options": {"included": true, "records": 20, "avg_iv": 0.28},
+  "distillation": {"included": true, "model": "gpt-o4-mini"}
+}

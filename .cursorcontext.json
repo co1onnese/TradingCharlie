@@ -1,0 +1,501 @@
+{
+  "version": 1,
+  "generated_at": "2025-10-19T00:00:00Z",
+  "project": {
+    "name": "charlie-tr1-db",
+    "description": "Multi-modal financial forecasting dataset pipeline using Metaflow, PostgreSQL, and local filesystem storage.",
+    "language": "python",
+    "python_requires": ">=3.10",
+    "orchestration": "Metaflow FlowSpec pipeline with step-based DAG",
+    "data_persistence": {
+      "database": "PostgreSQL via SQLAlchemy (schema: charlie)",
+      "file_storage": "Local JSON artifacts under DATA_ROOT (default: /opt/charlie_data)"
+    },
+    "runtime": {
+      "os": "linux",
+      "tools": ["metaflow", "sqlalchemy", "pandas", "requests", "tenacity"],
+      "env": {
+        "DATA_ROOT": "CHARLIE_DATA_ROOT",
+        "DB_URL": "CHARLIE_DB_URL",
+        "API_KEYS": [
+          "FINNHUB_API_KEY",
+          "SERPAPI_KEY",
+          "SIMFIN_API_KEY",
+          "FMP_API_KEY",
+          "EODHD_API_KEY",
+          "FRED_API_KEY",
+          "NEWSAPI_KEY",
+          "CHARLIE_LLM_API_KEY"
+        ]
+      }
+    }
+  },
+  "directory_structure": [
+    {"path": ".", "type": "dir", "purpose": "Repo root"},
+    {"path": "charlie_tr1_flow.py", "type": "file", "purpose": "Main Metaflow FlowSpec pipeline defining all steps"},
+    {"path": "charlie_tr1_flow.py.backup_full", "type": "file", "purpose": "Backup copy of pipeline (not used)"},
+    {"path": "charlie_fetchers.py", "type": "file", "purpose": "API clients: Yahoo, Finnhub, FRED, FMP, NewsAPI, Google News, EODHD, SimFin, LLM"},
+    {"path": "charlie_utils.py", "type": "file", "purpose": "Config, storage, DB helpers, technicals, labels, misc utilities"},
+    {"path": "charlie.ddl", "type": "file", "purpose": "PostgreSQL schema (tables, indexes, materialized views, helpers)"},
+    {"path": "pyproject.toml", "type": "file", "purpose": "Build and dependency configuration (UV/hatch)"},
+    {"path": "README.md", "type": "file", "purpose": "Project overview, setup, usage, architecture"},
+    {"path": "example_sources_meta.json", "type": "file", "purpose": "Example structure for \"sources_meta\" provenance JSON"},
+    {"path": "run_test.sh", "type": "file", "purpose": "Example script to run a small pipeline job"},
+    {"path": "scripts/init_db.sh", "type": "file", "purpose": "Initialize DB schema, indexes, materialized views"},
+    {"path": "scripts/verify_setup.sh", "type": "file", "purpose": "Environment and DB verification script"},
+    {"path": ".metaflow/", "type": "dir", "purpose": "Metaflow runtime artifacts for previous runs (logs, task data)"},
+    {"path": "__pycache__/", "type": "dir", "purpose": "Python bytecode cache"},
+    {"path": "2509.11420v1.pdf", "type": "file", "purpose": "Reference paper (likely related to methodology)"}
+  ],
+  "files": {
+    "charlie_tr1_flow.py": {
+      "type": "python",
+      "purpose": "Defines the end-to-end Metaflow pipeline CharlieTR1Pipeline with parameters, steps, and data flow.",
+      "components": {
+        "class": "CharlieTR1Pipeline(FlowSpec)",
+        "parameters": [
+          {"name": "tickers", "default": "AAPL,NVDA,MSFT,AMZN,META", "purpose": "Asset universe (comma-separated)"},
+          {"name": "start_date", "default": null, "purpose": "Backfill start (inclusive)"},
+          {"name": "end_date", "default": null, "purpose": "Backfill end (inclusive)"},
+          {"name": "as_of_date", "default": null, "purpose": "Single-date mode"},
+          {"name": "seed", "default": 1234, "purpose": "Random seed for sampling"},
+          {"name": "variation_count", "default": 20, "purpose": "Number of prompt variations per (ticker,date)"},
+          {"name": "token_budget", "default": 8192, "purpose": "Approximate token budget for prompt assembly"}
+        ],
+        "steps": [
+          {
+            "name": "start",
+            "responsibility": "Validate inputs, compute date list, prepare storage dirs, write initial pipeline_run, fan-out foreach by ticker.",
+            "state": ["api_status", "ticker_list", "date_list", "run_meta", "run_id", "raw_dir", "normalized_dir", "assembled_dir", "labels_dir", "thesis_dir", "exports_dir"],
+            "entry_points": ["CLI: python charlie_tr1_flow.py run ..."],
+            "error_handling": "try/except around DB write; logs exception and proceeds without run_id",
+            "performance": "No heavy work; sets up for parallel foreach"
+          },
+          {
+            "name": "ingest_raw",
+            "responsibility": "Per-ticker ingestion across dates: fetch news, alt news, Yahoo OHLCV, FMP fundamentals, EODHD options; write JSON files; insert DB rows.",
+            "state": ["ticker", "asset_id", "fetched_manifest", "manifest_path"],
+            "children": ["fetch_finnhub_news", "fetch_google_news", "fetch_newsapi_alt", "fetch_yahoo_ohlcv", "fetch_fmp_fundamentals", "fetch_eodhd_options", "insert_*", "save_obj_and_record"],
+            "error_handling": "Guarded per-source try/except with logger.exception; continues on partial failures.",
+            "performance": "Retries handled in fetchers; per-date loop; file-based artifacts to avoid large DB payloads",
+            "edge_cases": ["Missing API keys -> skips and logs", "Empty responses -> warns"]
+          },
+          {
+            "name": "normalize_dedupe",
+            "responsibility": "Normalize deduped news for ticker; compute tokens_count; write normalized JSON; placeholder for DB normalized tables.",
+            "state": ["asset_id"],
+            "error_handling": "try/except per-row; logs and continues",
+            "performance": "Operates row-wise; future enhancement to stream large tables"
+          },
+          {
+            "name": "compute_technicals",
+            "responsibility": "Read price_window rows, compute indicators via compute_technical_indicators, upsert technicals, persist normalized artifacts.",
+            "state": ["asset_id"],
+            "error_handling": "try/except per price_window; logs failures",
+            "performance": "Vectorized pandas ops; writes compact JSON; idempotent upserts"
+          },
+          {
+            "name": "assemble_samples",
+            "responsibility": "For each (ticker,date), create N prompt variations with sources_meta, within token budget; insert assembled_sample rows.",
+            "state": ["assembled_sample_ids"],
+            "children": ["truncate_text_for_budget", "insert_assembled_sample"],
+            "error_handling": "try/except around DB reads; defaults empty windows",
+            "performance": "Lightweight string assembly; tracks token counts"
+          },
+          {
+            "name": "generate_labels",
+            "responsibility": "Compute Algorithm S1 labels from price history; join to assembled samples; write sample_label rows.",
+            "children": ["compute_labels_for_asset", "insert_sample_label"],
+            "error_handling": "try/except around query and per-sample insert; logs and continues",
+            "performance": "Vectorized pandas; single pass; uses SQL indexes"
+          },
+          {
+            "name": "distill_theses",
+            "responsibility": "Batch LLM calls to generate investment theses for a subset of samples; store files and DB rows.",
+            "children": ["run_llm_distillation_batch", "insert_distilled_thesis"],
+            "error_handling": "Batch try/except; on failure creates stub theses",
+            "performance": "Batches via configurable batch_size; simple rate limiting"
+          },
+          {
+            "name": "export_parquet",
+            "responsibility": "Join samples + labels + theses for ticker; write Parquet export partitioned by ticker.",
+            "error_handling": "If no records, logs warning",
+            "performance": "Columnar parquet via pyarrow/fastparquet; partitioned output"
+          },
+          {
+            "name": "join_all",
+            "responsibility": "Join foreach branches; aggregate artifacts; finalize run_meta; update DB.",
+            "error_handling": "Defensive when run_meta/run_id missing; per-child aggregation try/except",
+            "performance": "Lightweight aggregation"
+          },
+          {"name": "end", "responsibility": "Log completion"}
+        ]
+      },
+      "dependencies": ["metaflow", "sqlalchemy", "pandas", "charlie_utils", "charlie_fetchers"],
+      "api_integration_points": ["Calls fetch_* functions per provider", "Uses storage abstraction for files", "Writes to DB via utils"],
+      "error_handling": "Extensive try/except with logger.exception; continues on partial failures to maximize throughput.",
+      "performance_notes": ["Parallelism via Metaflow foreach per ticker", "Idempotent upserts reduce duplication", "Batching for LLM calls"]
+    },
+    "charlie_fetchers.py": {
+      "type": "python",
+      "purpose": "Provider clients with retry logic; returns normalized dict/list payloads.",
+      "functions": [
+        {"name": "fetch_yahoo_ohlcv(ticker, as_of_date)", "responsibility": "15 trading days OHLCV via yfinance", "state": "stateless", "error_handling": "tenacity retries; logs errors; returns {}"},
+        {"name": "fetch_finnhub_news(ticker, as_of_date, api_key)", "responsibility": "Company news over last 30 days", "state": "stateless", "error_handling": "logs and returns [] if missing api or error"},
+        {"name": "fetch_fred_series(series_code, api_key)", "responsibility": "Economic time series from FRED", "state": "stateless"},
+        {"name": "fetch_fmp_fundamentals(ticker, start_date, api_key)", "responsibility": "Income statements via FMP v4/v3", "notes": "handles 403/404 fallback", "error_handling": "raise_for_status + try/except"},
+        {"name": "fetch_newsapi_alt(ticker, as_of_date, api_key)", "responsibility": "Alt news via NewsAPI with free-tier 30d constraint", "edge_cases": ["Skips if older than ~28 days"]},
+        {"name": "fetch_google_news(ticker, as_of_date, api_key)", "responsibility": "Google News via SerpAPI", "notes": "Flexible date parsing with dateutil"},
+        {"name": "fetch_eodhd_options(ticker, as_of_date, api_key)", "responsibility": "Options chain (current only on free tier)", "edge_cases": ["Skips historical dates"], "error_handling": "returns [] on errors"},
+        {"name": "fetch_eodhd_econ_events(start_date, end_date, api_key)", "responsibility": "Economic events calendar"},
+        {"name": "fetch_simfin_fundamentals(ticker, start_date, api_key)", "responsibility": "SimFin statements", "notes": "Auth via header"},
+        {"name": "run_llm_distillation_batch(prompts, llm_config)", "responsibility": "Generate theses using OpenAI; returns stub if unavailable", "performance": "Batch loop; short sleep for rate limiting"}
+      ],
+      "common_patterns": ["tenacity retry with exponential backoff", "requests.get with timeouts", "rate limiting via CONFIG.RATE_LIMIT_DELAY"],
+      "api_integration_points": ["Yahoo(yfinance)", "Finnhub", "FRED", "FMP", "NewsAPI", "SerpAPI", "EODHD", "SimFin", "OpenAI"],
+      "error_handling": "Consistent logging; safe fallbacks (empty results) to keep pipeline robust"
+    },
+    "charlie_utils.py": {
+      "type": "python",
+      "purpose": "Configuration, logging, storage abstraction, DB helpers, feature engineering.",
+      "config": {
+        "CONFIG": {
+          "DATA_ROOT": "CHARLIE_DATA_ROOT or /opt/charlie_data",
+          "DB_URL": "CHARLIE_DB_URL or local default",
+          "STORAGE_BACKEND": "local|s3 (s3 not implemented)",
+          "LLM": {"provider": "openai", "api_key": "env", "model": "gpt-4o-mini", "batch_size": "env"},
+          "API_KEYS": ["FINNHUB_API_KEY", "SERPAPI_KEY", "SIMFIN_API_KEY", "FMP_API_KEY", "EODHD_API_KEY", "FRED_API_KEY", "NEWSAPI_KEY"],
+          "PIPELINE": {"MAX_RETRIES": "env", "RATE_LIMIT_DELAY": "env", "DEBUG": "env"}
+        },
+        "validate_and_log_config": "Logs availability of libraries and API keys; warns if none available"
+      },
+      "storage": {
+        "LocalStorage": "JSON save/read, mkdirs, recursive list rooted at DATA_ROOT",
+        "S3Storage": "stub; to be implemented with boto3",
+        "storage": "selected instance based on CONFIG.STORAGE_BACKEND"
+      },
+      "db_helpers": [
+        "get_db_engine()",
+        "write_pipeline_run_to_db(run_meta)",
+        "upsert_asset(ticker)",
+        "insert_raw_news(row) [ON CONFLICT dedupe_hash]",
+        "insert_price_window(row) [ON CONFLICT (asset_id, as_of_date)]",
+        "insert_raw_fmp_fundamentals(row)",
+        "insert_raw_eodhd_options(row)",
+        "insert_assembled_sample(row) [ON CONFLICT unique triple]",
+        "insert_sample_label(row) [UPDATE-or-INSERT]",
+        "insert_distilled_thesis(row) [UPDATE-or-INSERT]"
+      ],
+      "utilities": [
+        "sha256_hash(s)",
+        "save_obj_and_record(storage, obj, base_dir, filename)",
+        "date_range(start, end)",
+        "truncate_text_for_budget(text, token_budget)"
+      ],
+      "feature_engineering": [
+        "compute_technical_indicators(ohlcv_df): basic MAs, EMA, MACD, RSI, ATR, Bollinger",
+        "compute_labels_for_asset(df): Algorithm S1 with quantile-based 5-class labels"
+      ],
+      "error_handling": "Minimal; DB helpers rely on transactional blocks; callers catch exceptions",
+      "performance_notes": ["ON CONFLICT upserts", "vectorized pandas ops", "compact JSON artifacts"]
+    },
+    "charlie.ddl": {
+      "type": "sql",
+      "purpose": "Defines schema 'charlie': core tables, indexes, materialized views, and audit log.",
+      "key_tables": [
+        "asset", "raw_news", "raw_news_alt", "price_window", "raw_fmp_fundamentals", "raw_eodhd_options",
+        "raw_eodhd_economic_events", "assembled_sample", "sample_label", "distilled_thesis", "pipeline_run", "audit_log"
+      ],
+      "indexes": [
+        "asset.ticker UNIQUE", "raw_news(asset_id,published_at)", "raw_news_alt(asset_id,published_at)",
+        "price_window UNIQUE(asset_id,as_of_date)", "assembled_sample UNIQUE(asset_id,as_of_date,variation_id)",
+        "GIN on assembled_sample.sources_meta", "HASH on raw_news.dedupe_hash"
+      ],
+      "materialized_views": ["label_distribution", "source_summary", "pipeline_run_summary"]
+    },
+    "pyproject.toml": {
+      "type": "toml",
+      "purpose": "Defines project metadata, dependencies, testing and linting config.",
+      "dependencies": {
+        "core": ["metaflow", "sqlalchemy", "psycopg2-binary", "pandas", "pyarrow", "fastparquet"],
+        "apis": ["yfinance", "requests", "fredapi", "finnhub-python", "google-search-results", "openai", "anthropic"],
+        "analysis": ["ta"],
+        "utils": ["python-dateutil", "tqdm", "python-dotenv", "tenacity", "beautifulsoup4", "lxml", "html5lib"],
+        "dev": ["pytest", "pytest-cov", "black", "ruff"]
+      }
+    },
+    "README.md": {
+      "type": "md",
+      "purpose": "Human-readable overview and instructions: setup, architecture, status, schema, queries, future work.",
+      "highlights": [
+        "Explains 8 pipeline steps and data directories under DATA_ROOT",
+        "Documents API keys and environment variables",
+        "Lists TODOs for full production implementation"
+      ]
+    },
+    "example_sources_meta.json": {
+      "type": "json",
+      "purpose": "Reference payload for sources_meta stored with assembled samples.",
+      "notes": "Shows counts, sources, indicators included, and LLM model metadata"
+    },
+    "run_test.sh": {
+      "type": "bash",
+      "purpose": "Example run script exporting sample API keys and executing a small run.",
+      "security_note": "Avoid committing real API keys; prefer .env files and secrets managers"
+    },
+    "scripts/init_db.sh": {
+      "type": "bash",
+      "purpose": "Initializes charlie schema, indexes, materialized views; verifies DB connectivity.",
+      "inputs": ["CHARLIE_DB_HOST", "CHARLIE_DB_PORT", "CHARLIE_DB_NAME", "CHARLIE_DB_USER", "CHARLIE_DB_PASSWORD"],
+      "outputs": ["schema installed", "performance indexes", "refresh function"],
+      "error_handling": "Exits on failures; checks for psql availability"
+    },
+    "scripts/verify_setup.sh": {
+      "type": "bash",
+      "purpose": "Checks Python/UV/psql presence, DB connectivity, and required files; prints next steps.",
+      "notes": "Non-destructive verification"
+    }
+  },
+  "architecture": {
+    "pattern": "DAG-style ETL orchestrated by Metaflow with per-ticker parallel branches",
+    "flow": [
+      "start -> ingest_raw(ticker foreach) -> normalize_dedupe -> compute_technicals -> assemble_samples -> generate_labels -> distill_theses -> export_parquet -> join_all -> end"
+    ],
+    "data_lineage": {
+      "raw": "Provider JSON saved under raw/<source>/<ticker>/<date>",
+      "normalized": "Cleaned news and computed technicals under normalized/...",
+      "assembled": "Prompt JSON under assembled/<ticker>/<date>",
+      "labels": "Labels computed and written to DB",
+      "theses": "Distilled theses saved under distilled_theses/<ticker>",
+      "exports": "Parquet per ticker under exports/parquet/<ticker>"
+    },
+    "dependencies": {
+      "external_services": ["Finnhub", "Google News (SerpAPI)", "NewsAPI", "Yahoo Finance", "FMP", "EODHD", "FRED", "SimFin", "OpenAI"],
+      "infrastructure": ["PostgreSQL", "local filesystem (extensible to S3)"]
+    }
+  },
+  "feature_breakdown": [
+    {
+      "feature": "Ingestion",
+      "entry_points": ["ingest_raw step"],
+      "components": ["fetch_finnhub_news", "fetch_google_news", "fetch_newsapi_alt", "fetch_yahoo_ohlcv", "fetch_fmp_fundamentals", "fetch_eodhd_options"],
+      "workflow": "For each date: call provider, write JSON file, insert DB row with file path and minimal normalization.",
+      "state_management": "Maintains fetched_manifest; DB holds raw_* and price_window records",
+      "loading_states": ["Per-source fetching with retries", "Rate-limited requests"],
+      "error_states": ["HTTP errors -> logged and skipped", "Missing API keys -> skip"],
+      "dependencies": ["requests", "tenacity", "provider SDKs", "CONFIG API keys"]
+    },
+    {
+      "feature": "Normalization & Deduplication",
+      "entry_points": ["normalize_dedupe step"],
+      "components": ["sha256_hash", "save_obj_and_record"],
+      "workflow": "Load raw_news rows, compute dedupe hash, skip duplicates, compute token estimates, persist normalized JSON.",
+      "state_management": "In-memory sets for dedupe; outputs files; TODO: normalized DB tables",
+      "loading_states": ["Iterative row processing"],
+      "error_states": ["Malformed JSON -> skip and log"]
+    },
+    {
+      "feature": "Technical Indicators",
+      "entry_points": ["compute_technicals step"],
+      "components": ["compute_technical_indicators", "insert_price_window"],
+      "workflow": "For each price window, compute indicators and upsert into price_window. Save normalized JSON per as_of_date.",
+      "state_management": "DB serves as source of truth; artifacts mirror JSON subset",
+      "loading_states": ["Vectorized computation"],
+      "error_states": ["Insufficient data -> skip indicators"]
+    },
+    {
+      "feature": "Sample Assembly",
+      "entry_points": ["assemble_samples step"],
+      "components": ["truncate_text_for_budget", "insert_assembled_sample"],
+      "workflow": "Build prompt text from technicals (and future modalities), apply token budget, persist prompt and DB record.",
+      "state_management": "Collects sample_ids for downstream steps",
+      "loading_states": ["Loop over variation_count"],
+      "error_states": ["Missing upstream data -> generate minimal prompt"]
+    },
+    {
+      "feature": "Label Generation",
+      "entry_points": ["generate_labels step"],
+      "components": ["compute_labels_for_asset", "insert_sample_label"],
+      "workflow": "Compute forward-returns signals and map to quantiles; write per-sample labels if date matches.",
+      "state_management": "Uses pandas DataFrame; writes to DB",
+      "loading_states": ["Single batch computation"],
+      "error_states": ["Empty price history -> warning; no labels"]
+    },
+    {
+      "feature": "LLM Distillation",
+      "entry_points": ["distill_theses step"],
+      "components": ["run_llm_distillation_batch", "insert_distilled_thesis"],
+      "workflow": "Sample subset of prompts, generate theses via OpenAI, persist artifacts and DB rows.",
+      "state_management": "outputs list of generated theses per sample",
+      "loading_states": ["Batch loop with rate limiting"],
+      "error_states": ["API errors -> stub theses"]
+    },
+    {
+      "feature": "Export",
+      "entry_points": ["export_parquet step"],
+      "components": ["pandas.to_parquet"],
+      "workflow": "Join assembled_sample + sample_label + distilled_thesis for asset_id and write partitioned parquet.",
+      "state_management": "Adds path to run_meta.artifacts",
+      "loading_states": ["I/O-bound write"],
+      "error_states": ["No joined records -> warning"]
+    }
+  ],
+  "component_docs": [
+    {
+      "component": "Pipeline step: start",
+      "responsibility": "Initialize run, validate config, compute date list, create directories.",
+      "props": ["tickers", "start_date", "end_date", "as_of_date", "seed", "variation_count", "token_budget"],
+      "state": ["api_status", "ticker_list", "date_list", "run_meta", "run_id"],
+      "children": ["get_db_engine", "write_pipeline_run_to_db", "storage.makedirs"],
+      "events": ["next -> ingest_raw (foreach by ticker)"]
+    },
+    {
+      "component": "Pipeline step: ingest_raw",
+      "responsibility": "Fetch and persist raw data per provider for a ticker/date.",
+      "props": ["ticker (self.input)"],
+      "state": ["asset_id", "fetched_manifest", "manifest_path"],
+      "children": ["fetch_*", "insert_*", "save_obj_and_record"],
+      "events": ["next -> normalize_dedupe"],
+      "error_handling": "Per-provider try/except; continues on failure",
+      "performance": "Provider-level retries; file-based buffering"
+    },
+    {
+      "component": "Pipeline step: normalize_dedupe",
+      "responsibility": "Deduplicate and normalize news articles; compute token counts.",
+      "props": [],
+      "state": ["asset_id"],
+      "children": ["sha256_hash", "save_obj_and_record"],
+      "events": ["next -> compute_technicals"]
+    },
+    {
+      "component": "Pipeline step: compute_technicals",
+      "responsibility": "Compute technical indicators and persist to DB and normalized files.",
+      "props": [],
+      "state": ["asset_id"],
+      "children": ["compute_technical_indicators", "insert_price_window"],
+      "events": ["next -> assemble_samples"]
+    },
+    {
+      "component": "Pipeline step: assemble_samples",
+      "responsibility": "Create prompt variations for downstream labeling and distillation.",
+      "props": ["variation_count", "token_budget"],
+      "state": ["assembled_sample_ids"],
+      "children": ["truncate_text_for_budget", "insert_assembled_sample"],
+      "events": ["next -> generate_labels"]
+    },
+    {
+      "component": "Pipeline step: generate_labels",
+      "responsibility": "Compute Algorithm S1 labels and join per sample.",
+      "props": [],
+      "state": [],
+      "children": ["compute_labels_for_asset", "insert_sample_label"],
+      "events": ["next -> distill_theses"]
+    },
+    {
+      "component": "Pipeline step: distill_theses",
+      "responsibility": "Generate LLM theses for selected prompts.",
+      "props": ["CONFIG.LLM"],
+      "state": [],
+      "children": ["run_llm_distillation_batch", "insert_distilled_thesis"],
+      "events": ["next -> export_parquet"]
+    },
+    {
+      "component": "Pipeline step: export_parquet",
+      "responsibility": "Export final joined dataset to parquet.",
+      "props": [],
+      "state": [],
+      "children": ["pandas.DataFrame.to_parquet"],
+      "events": ["next -> join_all"]
+    },
+    {
+      "component": "Storage: LocalStorage",
+      "responsibility": "Read/write JSON and directory management under DATA_ROOT.",
+      "props": ["root"],
+      "state": [],
+      "children": ["json.dump", "pathlib.Path"],
+      "error_handling": "Ensures parent directories exist"
+    },
+    {
+      "component": "DB helpers (utils)",
+      "responsibility": "Encapsulate SQL operations with upsert patterns.",
+      "props": ["Engine"],
+      "state": [],
+      "children": ["sqlalchemy.text", "engine.begin"],
+      "error_handling": "Relies on transactional semantics; callers handle exceptions"
+    },
+    {
+      "component": "Fetcher: fetch_yahoo_ohlcv",
+      "responsibility": "Return 15-day OHLCV window.",
+      "props": ["ticker", "as_of_date"],
+      "state": [],
+      "error_handling": "tenacity + logging; returns {} on failure"
+    }
+  ],
+  "state_management": {
+    "stores": [
+      {
+        "name": "Metaflow step state",
+        "purpose": "Transient step-local variables (e.g., ticker, date_list, assembled_sample_ids).",
+        "structure": "Python primitives, lists, dicts attached to self",
+        "actions": ["set at step", "passed to next via Metaflow"],
+        "selectors": ["n/a"],
+        "integration_points": ["All steps"],
+        "data_flow": "start seeds run_meta/date_list -> foreach ticker branches carry asset_id -> downstream steps read/write DB and files"
+      },
+      {
+        "name": "PostgreSQL (schema: charlie)",
+        "purpose": "System of record for metadata and structured outputs.",
+        "structure": ["asset", "raw_*", "price_window", "assembled_sample", "sample_label", "distilled_thesis", "pipeline_run"],
+        "actions": ["INSERT", "UPSERT (ON CONFLICT)", "UPDATE-or-INSERT"],
+        "selectors": ["SQL filters on asset_id, as_of_date"],
+        "integration_points": ["All pipeline steps after ingestion"],
+        "data_flow": "Ingestion writes raw; normalize/technicals update; assembly/labels/theses populate; export reads join"
+      },
+      {
+        "name": "Local filesystem",
+        "purpose": "Artifact storage for raw/normalized/assembled/theses and parquet exports.",
+        "structure": "Hierarchical directories under DATA_ROOT",
+        "actions": ["save_json", "read_json", "mkdirs", "rglob list"],
+        "selectors": ["path conventions include source/ticker/date"],
+        "integration_points": ["All steps save/load JSON artifacts"],
+        "data_flow": "Files written per source; DB rows keep file_path pointers"
+      }
+    ]
+  },
+  "utilities": [
+    {"name": "sha256_hash", "purpose": "Deduplication key for news"},
+    {"name": "truncate_text_for_budget", "purpose": "Approximate token budgeting using 1 token ≈ 4 chars"},
+    {"name": "compute_technical_indicators", "purpose": "Basic TA set for prompts and analysis"},
+    {"name": "compute_labels_for_asset", "purpose": "Implements Algorithm S1 label generation"},
+    {"name": "save_obj_and_record", "purpose": "Write JSON and return absolute path for persistence"}
+  ],
+  "code_standards_and_patterns": {
+    "style": ["Black/Ruff configured (line length 120)", "Explicit, readable function names"],
+    "error_handling": ["Prefer try/except with logging; avoid crashing entire run", "Fetchers use tenacity retries"],
+    "config": ["Environment-driven CONFIG with dotenv support", "API availability logged at start"],
+    "db": ["SQLAlchemy text queries with parameter binding", "Idempotent upserts to ensure repeatability"],
+    "testing": ["pytest config present; tests dir not included here"]
+  },
+  "security_considerations": {
+    "secrets_management": ["API keys expected via environment variables; avoid committing to VCS", "Consider .env + secrets manager (e.g., sops/1Password/AWS SM)"],
+    "script_risks": ["run_test.sh currently hardcodes sample API keys—remove or replace with env sourcing"],
+    "db_security": ["DB URL includes credentials; prefer env vars and least-privilege users"],
+    "network_calls": ["All provider calls use HTTPS with timeouts"],
+    "data_privacy": ["Persisted raw JSON may contain PII from news sources—review retention and masking policies"]
+  },
+  "performance_optimizations": {
+    "pipeline": ["Per-ticker parallelism via foreach", "Reduce recomputation via ON CONFLICT upserts"],
+    "io": ["Write compact JSON artifacts; parquet for analytics"],
+    "api": ["tenacity retries with backoff; rate limiting via CONFIG.RATE_LIMIT_DELAY"],
+    "db": ["Composite indexes for common query paths; GIN on JSONB; HASH on dedupe_hash"],
+    "llm": ["Batch size configurable; lightweight rate limiting"]
+  },
+  "known_gaps_and_todos": [
+    "S3Storage not implemented (stub)",
+    "Fetcher functions may require pagination, richer normalization, and error taxonomy",
+    "Normalization step does not update normalized DB tables yet",
+    "Assemble step currently relies mostly on technicals; news/fundamentals sampling is TODO",
+    "Label generation assumes representative last close per window; refine alignment",
+    "OpenAI/LLM integration lacks cost tracking and caching"
+  ]
+}
