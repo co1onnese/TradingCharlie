@@ -17,7 +17,7 @@
       "example_sources_meta.json": "Reference JSON showing the structure of `sources_meta` payloads saved with assembled prompts.",
       "pyproject.toml": "Project packaging and dependency manifest; pins Metaflow, pandas, SQLAlchemy, API clients, LLM SDKs, and developer tooling (pytest, black, ruff).",
       "README.md": "Minimal project heading placeholder.",
-      "run_test.sh": "Convenience shell script for running tests (not inspected but assumed to execute pytest)."
+      "scripts/run_pipeline.sh": "Convenience shell script for running the Charlie-TR1-DB pipeline with sample data."
     },
     "directories": {
       "scripts": "Operational scripts: `init_db.sh` bootstraps the PostgreSQL schema, indexes, and materialized views; `verify_setup.sh` validates local environment, DB connectivity, and presence of key project files.",
@@ -257,7 +257,7 @@
     "database_setup": "`scripts/init_db.sh` applies schema, additional indexes (GIN, hash, composite), creates materialized views and refresh function, verifies counts.",
     "verification": "`scripts/verify_setup.sh` ensures Python3, uv, PostgreSQL availability, tests DB connectivity, reports missing key files, suggests next steps.",
     "build_config": "pyproject uses Hatch build backend; dependencies include Metaflow, pandas, pyarrow, fastparquet, yfinance, finnhub, fredapi, openai, anthropic, Tenacity, and dev extras for linting/testing.",
-    "testing": "Tests executed via pytest (see `tests/test_charlie_pipeline.py`); CI not defined but run_test.sh expected to trigger pytest.",
+    "testing": "Tests executed via pytest (see `tests/test_charlie_pipeline.py`); CI not defined but pipeline execution via `scripts/run_pipeline.sh`.",
     "metaflow_requirements": "Local mode without S3 datastore; batch decorators commented out for future cloud execution."
   },
   "security": {
@@ -275,7 +275,7 @@
   },
   "testing": {
     "unit": "`tests/test_charlie_pipeline.py` covers content hashing, bucket logic, relevance heuristics, label computation edge cases, timezone normalization, and import sanity checks.",
-    "execution": "Pytest configuration (pyproject) runs with coverage and verbose output via `python -m pytest` or `run_test.sh`."
+    "execution": "Pytest configuration (pyproject) runs with coverage and verbose output via `python -m pytest` or `scripts/run_pipeline.sh` for pipeline execution."
   },
   "api_dependencies": {
     "market_data": [
@@ -333,7 +333,7 @@
     {"path": "pyproject.toml", "type": "file", "purpose": "Build and dependency configuration (UV/hatch)"},
     {"path": "README.md", "type": "file", "purpose": "Project overview, setup, usage, architecture"},
     {"path": "example_sources_meta.json", "type": "file", "purpose": "Example structure for \"sources_meta\" provenance JSON"},
-    {"path": "run_test.sh", "type": "file", "purpose": "Example script to run a small pipeline job"},
+    {"path": "scripts/run_pipeline.sh", "type": "file", "purpose": "Example script to run a small pipeline job"},
     {"path": "scripts/init_db.sh", "type": "file", "purpose": "Initialize DB schema, indexes, materialized views"},
     {"path": "scripts/verify_setup.sh", "type": "file", "purpose": "Environment and DB verification script"},
     {"path": ".metaflow/", "type": "dir", "purpose": "Metaflow runtime artifacts for previous runs (logs, task data)"},
@@ -531,7 +531,7 @@
       "purpose": "Reference payload for sources_meta stored with assembled samples.",
       "notes": "Shows counts, sources, indicators included, and LLM model metadata"
     },
-    "run_test.sh": {
+    "scripts/run_pipeline.sh": {
       "type": "bash",
       "purpose": "Example run script exporting sample API keys and executing a small run.",
       "security_note": "Avoid committing real API keys; prefer .env files and secrets managers"
@@ -771,7 +771,7 @@
   },
   "security_considerations": {
     "secrets_management": ["API keys expected via environment variables; avoid committing to VCS", "Consider .env + secrets manager (e.g., sops/1Password/AWS SM)"],
-    "script_risks": ["run_test.sh currently hardcodes sample API keys—remove or replace with env sourcing"],
+    "script_risks": ["scripts/run_pipeline.sh currently hardcodes sample API keys—remove or replace with env sourcing"],
     "db_security": ["DB URL includes credentials; prefer env vars and least-privilege users"],
     "network_calls": ["All provider calls use HTTPS with timeouts"],
     "data_privacy": ["Persisted raw JSON may contain PII from news sources—review retention and masking policies"]

@@ -1,11 +1,11 @@
 #!/bin/bash
-# run_test.sh
+# run_pipeline.sh
 #
-# Run Charlie-TR1-DB pipeline test with AAPL
+# Run Charlie-TR1-DB pipeline with sample data (AAPL)
 #
 # Usage:
-#   ./run_test.sh         # Run pipeline normally
-#   ./run_test.sh --clean # Clean all data first, then run pipeline
+#   ./scripts/run_pipeline.sh         # Run pipeline normally
+#   ./scripts/run_pipeline.sh --clean # Clean all data first, then run pipeline
 
 set -euo pipefail
 
