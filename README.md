@@ -133,7 +133,7 @@ python charlie_tr1_flow.py run \
 ```
 /opt/T1/
 ├── charlie_tr1_flow.py      # Main Metaflow pipeline
-├── charlie.ddl               # Database schema definition
+├── scripts/init_charlie_db.sql  # Database schema definition
 ├── pyproject.toml            # UV project configuration
 ├── .python-version           # Python version for UV
 ├── README.md                 # This file
@@ -317,5 +317,5 @@ Don't ask, don't tell...
 ## 📚 References
 
 - Product Requirements Document: `/opt/T1/data_flow_design.md`
-- Database Schema: `/opt/T1/charlie.ddl`
+- Database Schema: `/opt/T1/scripts/init_charlie_db.sql`
 - Example Metadata: `/opt/T1/example_sources_meta.json`

@@ -45,7 +45,7 @@ if command -v psql &> /dev/null; then
         echo "   ✓ Found $INDEX_COUNT indexes"
     else
         echo "   ✗ Cannot connect to database"
-        echo "   Run: sudo -u postgres psql -d charlie -f /opt/T1/charlie.ddl"
+        echo "   Run: sudo -u postgres psql -d charlie -f /opt/T1/scripts/init_charlie_db.sql"
         exit 1
     fi
 else
@@ -59,7 +59,7 @@ FILES=(
     "/opt/T1/pyproject.toml"
     "/opt/T1/.python-version"
     "/opt/T1/charlie_tr1_flow.py"
-    "/opt/T1/charlie.ddl"
+    "/opt/T1/scripts/init_charlie_db.sql"
     "/opt/T1/README.md"
     "/opt/T1/IMPLEMENTATION_STATUS.md"
 )

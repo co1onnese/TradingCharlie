@@ -13,7 +13,7 @@
       "charlie_tr1_flow.py": "Defines `CharlieTR1Pipeline`, a Metaflow FlowSpec implementing the end-to-end ETL: validates configuration, runs per-ticker foreach branches for ingestion through export, coordinates DB persistence, and refreshes materialized views.",
       "charlie_fetchers.py": "Houses API client functions for Yahoo Finance, Finnhub, NewsAPI, SerpAPI Google News, FMP, EODHD, SimFin, and LLM distillation with tenacity retry wrappers and rate limiting hooks.",
       "charlie_utils.py": "Central utility module providing CONFIG bootstrap, logging, storage abstraction, SQLAlchemy helpers for all tables, technical indicator computations, labeling algorithm, hashing functions, and normalization helpers.",
-      "charlie.ddl": "PostgreSQL schema definition for the `charlie` namespace covering assets, raw/normalized news, fundamentals, macro data, price windows, assembled samples, labels, distilled theses, pipeline runs, and audit logging plus indexes and materialized views.",
+      "scripts/init_charlie_db.sql": "PostgreSQL schema definition for the `charlie` namespace covering assets, raw/normalized news, fundamentals, macro data, price windows, assembled samples, labels, distilled theses, pipeline runs, and audit logging plus indexes and materialized views.",
       "example_sources_meta.json": "Reference JSON showing the structure of `sources_meta` payloads saved with assembled prompts.",
       "pyproject.toml": "Project packaging and dependency manifest; pins Metaflow, pandas, SQLAlchemy, API clients, LLM SDKs, and developer tooling (pytest, black, ruff).",
       "README.md": "Minimal project heading placeholder.",
@@ -329,7 +329,7 @@
     {"path": "charlie_tr1_flow.py.backup_full", "type": "file", "purpose": "Backup copy of pipeline (not used)"},
     {"path": "charlie_fetchers.py", "type": "file", "purpose": "API clients: Yahoo, Finnhub, FRED, FMP, NewsAPI, Google News, EODHD, SimFin, LLM"},
     {"path": "charlie_utils.py", "type": "file", "purpose": "Config, storage, DB helpers, technicals, labels, misc utilities"},
-    {"path": "charlie.ddl", "type": "file", "purpose": "PostgreSQL schema (tables, indexes, materialized views, helpers)"},
+    {"path": "scripts/init_charlie_db.sql", "type": "file", "purpose": "PostgreSQL schema (tables, indexes, materialized views, helpers)"},
     {"path": "pyproject.toml", "type": "file", "purpose": "Build and dependency configuration (UV/hatch)"},
     {"path": "README.md", "type": "file", "purpose": "Project overview, setup, usage, architecture"},
     {"path": "example_sources_meta.json", "type": "file", "purpose": "Example structure for \"sources_meta\" provenance JSON"},
@@ -492,7 +492,7 @@
       "error_handling": "Minimal; DB helpers rely on transactional blocks; callers catch exceptions",
       "performance_notes": ["ON CONFLICT upserts", "vectorized pandas ops", "compact JSON artifacts"]
     },
-    "charlie.ddl": {
+    "scripts/init_charlie_db.sql": {
       "type": "sql",
       "purpose": "Defines schema 'charlie': core tables, indexes, materialized views, and audit log.",
       "key_tables": [

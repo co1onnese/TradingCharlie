@@ -32,18 +32,16 @@ if ! psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1" 
     echo "ERROR: Could not connect to database. Please check your connection settings."
     exit 1
 fi
-echo "✓ Database connection successful"
-
-# Initialize schema from DDL file
+echo "✓# Initialize schema from SQL file
 echo ""
 echo "Initializing database schema..."
-DDL_FILE="/opt/T1/charlie.ddl"
+DDL_FILE="/opt/T1/scripts/init_charlie_db.sql"
 if [ ! -f "$DDL_FILE" ]; then
-    echo "ERROR: DDL file not found at $DDL_FILE"
+    echo "ERROR: SQL file not found at $DDL_FILE"
     exit 1
 fi
 
-psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$DDL_FILE"
+psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$DDL_FILE"T" -U "$DB_USER" -d "$DB_NAME" -f "$DDL_FILE"
 echo "✓ Schema initialized"
 
 # Add additional indexes for performance (from PRD section 14.1)
