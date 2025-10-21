@@ -191,14 +191,35 @@ def check_api_readiness(config: Dict) -> bool:
 
 
 if __name__ == "__main__":
-    # Example usage
+    # Load environment variables from .env.local
+    from dotenv import load_dotenv
     import os
+    from pathlib import Path
     
-    # Hardcode the API keys for testing (from .env.local)
+    # Check if .env.local exists
+    env_file = Path('.env.local')
+    if not env_file.exists():
+        print("❌ Error: .env.local file not found!")
+        print("   Please create .env.local with your API keys:")
+        print("   FMP_API_KEY=your_fmp_key_here")
+        print("   EODHD_API_KEY=your_eodhd_key_here")
+        exit(1)
+    
+    # Load environment variables from .env.local
+    load_dotenv('.env.local')
+    
+    # Get API keys from environment variables
     config = {
-        'FMP_API_KEY': 'Db2EB156BSO8iSCDPuP2gCWJX2IO6shZ',
-        'EODHD_API_KEY': '68f49912abd075.05871806',
+        'FMP_API_KEY': os.environ.get('FMP_API_KEY', ''),
+        'EODHD_API_KEY': os.environ.get('EODHD_API_KEY', ''),
     }
+    
+    # Check if API keys are loaded
+    missing_keys = [key for key, value in config.items() if not value]
+    if missing_keys:
+        print(f"❌ Error: Missing API keys in .env.local: {', '.join(missing_keys)}")
+        print("   Please add the missing keys to your .env.local file")
+        exit(1)
     
     # Validate all API keys
     results = validate_all_api_keys(config)
