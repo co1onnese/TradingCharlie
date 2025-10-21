@@ -308,11 +308,11 @@ Every assembled sample includes `sources_meta` JSON tracking:
 
 ## 📄 License
 
-[Specify your license]
+Don't ask, don't tell...
 
 ## 👥 Contributors
 
-[List contributors]
+@lstn on discord & telegram
 
 ## 📚 References
 
