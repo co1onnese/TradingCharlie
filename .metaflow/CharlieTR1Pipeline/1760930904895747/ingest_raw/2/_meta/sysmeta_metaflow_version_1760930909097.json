@@ -1,1 +1,0 @@
-{"flow_id": "CharlieTR1Pipeline", "run_number": "1760930904895747", "step_name": "ingest_raw", "task_id": "2", "field_name": "metaflow_version", "type": "metaflow_version", "value": "2.18.12", "tags": ["attempt_id:0"], "user_name": "charlie", "ts_epoch": 1760930909097}

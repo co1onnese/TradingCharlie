@@ -1,1 +1,0 @@
-{"flow_id": "CharlieTR1Pipeline", "run_number": "1760930904895747", "step_name": "join_all", "task_id": "9", "field_name": "python_version", "type": "python_version", "value": "3.12.3", "tags": ["attempt_id:0"], "user_name": "charlie", "ts_epoch": 1760930969640}
