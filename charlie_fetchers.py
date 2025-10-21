@@ -167,8 +167,9 @@ def fetch_fmp_fundamentals(ticker: str, start_date: date, api_key: str) -> List[
     """
     Fetch financial statements from Financial Modeling Prep.
     Returns list of financial reports.
-    
-    NOTE: FMP v3 endpoints may require paid subscription. Free tier has limitations.
+
+    NOTE: Updated to use /stable/ API endpoints (legacy v3/v4 deprecated August 31, 2025)
+    Free tier limited to US stocks. International stocks require premium subscription.
     """
     if not api_key:
         logger.debug(f"FMP API key not configured, skipping fundamentals for {ticker}")
@@ -177,24 +178,28 @@ def fetch_fmp_fundamentals(ticker: str, start_date: date, api_key: str) -> List[
     try:
         logger.debug(f"Fetching FMP fundamentals for {ticker}")
 
-        # Try v4 endpoint first (more likely to work with free tier)
-        url = f"https://financialmodelingprep.com/api/v4/income-statement/{ticker}"
-        params = {"apikey": api_key, "limit": 8}  # Get last 2 years (quarterly)
+        # Use new stable API endpoint (symbol as query parameter)
+        url = "https://financialmodelingprep.com/stable/income-statement"
+        params = {"symbol": ticker, "apikey": api_key, "limit": 8}  # Get last 2 years (quarterly)
 
         response = requests.get(url, params=params, timeout=30)
-        
-        # If v4 fails, try v3 as fallback
-        if response.status_code == 403 or response.status_code == 404:
-            logger.debug(f"FMP v4 failed, trying v3 for {ticker}")
-            url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
-            response = requests.get(url, params=params, timeout=30)
-        
+
+        # Handle premium/subscription errors (402)
+        if response.status_code == 402:
+            logger.warning(f"FMP fundamentals for {ticker} requires premium subscription (402)")
+            return []
+
         response.raise_for_status()
         data = response.json()
-        
+
         # Check if response is an error message (FMP returns JSON even for errors)
         if isinstance(data, dict) and 'Error Message' in data:
             logger.warning(f"FMP API returned error for {ticker}: {data['Error Message']}")
+            return []
+
+        # Handle empty response
+        if not data or (isinstance(data, list) and len(data) == 0):
+            logger.info(f"No financial data available for {ticker}")
             return []
 
         time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
@@ -218,6 +223,12 @@ def fetch_fmp_fundamentals(ticker: str, start_date: date, api_key: str) -> List[
         logger.info(f"Fetched {len(results)} financial reports from FMP for {ticker}")
         return results
 
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 402:
+            logger.warning(f"FMP fundamentals for {ticker} requires premium subscription")
+        else:
+            logger.error(f"FMP fundamentals HTTP error for {ticker}: {e}")
+        return []
     except Exception as e:
         logger.error(f"FMP fundamentals fetch failed for {ticker}: {e}")
         return []
@@ -314,7 +325,12 @@ def fetch_google_news(ticker: str, as_of_date: date, api_key: str) -> List[Dict[
         results = []
         for article in data.get('news_results', []):
             # Parse date if available - Google News returns various formats
+            # Note: SerpAPI nests the date inside the article structure
             pub_date_str = article.get('date', '')
+            if not pub_date_str:
+                # Try getting date from the nested structure if not at top level
+                pub_date_str = article.get('raw_json', {}).get('date', '')
+
             pub_date = None
             if pub_date_str:
                 try:
@@ -322,17 +338,45 @@ def fetch_google_news(ticker: str, as_of_date: date, api_key: str) -> List[Dict[
                     from dateutil import parser
                     pub_date = parser.parse(pub_date_str)
                 except:
-                    # If parsing fails, leave as None
-                    logger.debug(f"Could not parse date: {pub_date_str}")
-                    pub_date = None
-            
+                    # Try parsing SerpAPI specific format: "10/19/2025, 10:46 AM, +0000 UTC"
+                    try:
+                        from datetime import datetime
+                        # Remove the timezone part and parse as naive datetime
+                        if ', +0000 UTC' in pub_date_str:
+                            # Format: "MM/DD/YYYY, HH:MM AM/PM, +0000 UTC"
+                            date_part = pub_date_str.replace(', +0000 UTC', '')
+                            pub_date = datetime.strptime(date_part, '%m/%d/%Y, %I:%M %p')
+                        else:
+                            logger.debug(f"Could not parse date: {pub_date_str}")
+                    except:
+                        logger.debug(f"Could not parse date: {pub_date_str}")
+                        pub_date = None
+
+            # Create a copy of article for raw_json storage, ensuring no datetime objects
+            import json
+            # Convert to JSON and back to remove datetime objects
+            try:
+                raw_json_copy = json.loads(json.dumps(article, default=str))
+            except:
+                # Fallback: remove known datetime fields
+                raw_json_copy = article.copy()
+                # Remove any datetime objects recursively
+                def remove_datetimes(obj):
+                    if isinstance(obj, dict):
+                        return {k: remove_datetimes(v) for k, v in obj.items() if not isinstance(v, datetime)}
+                    elif isinstance(obj, list):
+                        return [remove_datetimes(item) for item in obj]
+                    else:
+                        return obj
+                raw_json_copy = remove_datetimes(raw_json_copy)
+
             results.append({
                 "headline": article.get('title', ''),
                 "snippet": article.get('snippet', ''),
                 "url": article.get('link', ''),
                 "published_at": pub_date,
                 "source": article.get('source', {}).get('name', 'google_news') if isinstance(article.get('source'), dict) else 'google_news',
-                "raw_json": article
+                "raw_json": raw_json_copy
             })
 
         logger.info(f"Fetched {len(results)} articles from Google News for {ticker}")
@@ -500,6 +544,9 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
     """
     Fetch insider trading transactions from FMP API.
     Returns list of insider transactions up to as_of_date.
+
+    NOTE: Updated to use /stable/ API endpoints (legacy v3/v4 deprecated August 31, 2025)
+    Insider trading data may require premium subscription or may not be available on free tier.
     """
     if not api_key:
         logger.debug(f"FMP API key not configured, skipping insider transactions for {ticker}")
@@ -508,16 +555,29 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
     try:
         logger.debug(f"Fetching insider transactions for {ticker} up to {as_of_date}")
 
-        url = f"https://financialmodelingprep.com/api/v4/insider-trading"
-        params = {
-            "symbol": ticker,
-            "apikey": api_key,
-            "limit": 50  # Get last 50 transactions
-        }
+        # Use new stable API endpoint (may not support symbol filtering on free tier)
+        url = "https://financialmodelingprep.com/stable/insider-trading"
+        params = {"apikey": api_key, "limit": 100}  # Get more transactions, filter client-side
 
         response = requests.get(url, params=params, timeout=30)
+
+        # Handle premium/subscription errors (402)
+        if response.status_code == 402:
+            logger.warning(f"FMP insider transactions for {ticker} requires premium subscription (402)")
+            return []
+
         response.raise_for_status()
         data = response.json()
+
+        # Check if response is an error message (FMP returns JSON even for errors)
+        if isinstance(data, dict) and 'Error Message' in data:
+            logger.warning(f"FMP API returned error for insider transactions: {data['Error Message']}")
+            return []
+
+        # Handle empty response
+        if not data or (isinstance(data, list) and len(data) == 0):
+            logger.info(f"No insider transaction data available (may require premium subscription)")
+            return []
 
         time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
 
@@ -535,6 +595,11 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
             except:
                 continue
 
+            # Filter by ticker if available in response (may not be present in stable API)
+            txn_symbol = txn.get('symbol', '').upper()
+            if txn_symbol and txn_symbol != ticker.upper():
+                continue  # Skip transactions for other tickers
+
             results.append({
                 "filing_date": filing_date_str.split('T')[0],
                 "transaction_type": txn.get('transactionType', ''),
@@ -548,6 +613,12 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
         logger.info(f"Fetched {len(results)} insider transactions from FMP for {ticker}")
         return results
 
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 402:
+            logger.warning(f"FMP insider transactions for {ticker} requires premium subscription")
+        else:
+            logger.error(f"FMP insider transactions HTTP error for {ticker}: {e}")
+        return []
     except Exception as e:
         logger.error(f"FMP insider transactions fetch failed for {ticker}: {e}")
         return []
@@ -557,6 +628,9 @@ def fetch_analyst_recommendations(ticker: str, as_of_date: date, api_key: str) -
     """
     Fetch analyst recommendations from FMP API.
     Returns list of analyst ratings up to as_of_date.
+
+    NOTE: Updated to use /stable/ API endpoints (legacy v3/v4 deprecated August 31, 2025)
+    Free tier limited to US stocks. International stocks require premium subscription.
     """
     if not api_key:
         logger.debug(f"FMP API key not configured, skipping analyst recommendations for {ticker}")
@@ -565,15 +639,29 @@ def fetch_analyst_recommendations(ticker: str, as_of_date: date, api_key: str) -
     try:
         logger.debug(f"Fetching analyst recommendations for {ticker} up to {as_of_date}")
 
-        url = f"https://financialmodelingprep.com/api/v3/grade/{ticker}"
-        params = {
-            "apikey": api_key,
-            "limit": 20
-        }
+        # Use new stable API endpoint (symbol as query parameter)
+        url = "https://financialmodelingprep.com/stable/grades"
+        params = {"symbol": ticker, "apikey": api_key, "limit": 20}
 
         response = requests.get(url, params=params, timeout=30)
+
+        # Handle premium/subscription errors (402)
+        if response.status_code == 402:
+            logger.warning(f"FMP analyst recommendations for {ticker} requires premium subscription (402)")
+            return []
+
         response.raise_for_status()
         data = response.json()
+
+        # Check if response is an error message (FMP returns JSON even for errors)
+        if isinstance(data, dict) and 'Error Message' in data:
+            logger.warning(f"FMP API returned error for analyst recommendations: {data['Error Message']}")
+            return []
+
+        # Handle empty response
+        if not data or (isinstance(data, list) and len(data) == 0):
+            logger.info(f"No analyst recommendation data available for {ticker}")
+            return []
 
         time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
 
@@ -603,6 +691,12 @@ def fetch_analyst_recommendations(ticker: str, as_of_date: date, api_key: str) -
         logger.info(f"Fetched {len(results)} analyst recommendations from FMP for {ticker}")
         return results
 
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 402:
+            logger.warning(f"FMP analyst recommendations for {ticker} requires premium subscription")
+        else:
+            logger.error(f"FMP analyst recommendations HTTP error for {ticker}: {e}")
+        return []
     except Exception as e:
         logger.error(f"FMP analyst recommendations fetch failed for {ticker}: {e}")
         return []

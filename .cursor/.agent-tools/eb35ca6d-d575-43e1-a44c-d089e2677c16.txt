@@ -1,0 +1,945 @@
+diff --git a/.cursorcontext.json b/.cursorcontext.json
+index eb2f444..8670af0 100644
+--- a/.cursorcontext.json
++++ b/.cursorcontext.json
+@@ -1,3 +1,296 @@
++{
++  "project_metadata": {
++    "name": "Charlie TR1 DB",
++    "summary": "Metaflow-based multi-modal financial dataset builder that ingests market, news, fundamentals, options, macro, and analyst data, normalizes it, computes features, labels samples, distills LLM theses, and exports curated parquet datasets.",
++    "primary_languages": ["Python"],
++    "frameworks": ["Metaflow"],
++    "storage_backends": ["PostgreSQL", "Local filesystem JSON", "Parquet"],
++    "deployment_notes": "Designed for local runs with Metaflow local storage; configurable via environment variables loaded from .env.local."
++  },
++  "directory_overview": {
++    "root": "/opt/T1",
++    "files": {
++      "charlie_tr1_flow.py": "Defines `CharlieTR1Pipeline`, a Metaflow FlowSpec implementing the end-to-end ETL: validates configuration, runs per-ticker foreach branches for ingestion through export, coordinates DB persistence, and refreshes materialized views.",
++      "charlie_fetchers.py": "Houses API client functions for Yahoo Finance, Finnhub, NewsAPI, SerpAPI Google News, FMP, EODHD, SimFin, and LLM distillation with tenacity retry wrappers and rate limiting hooks.",
++      "charlie_utils.py": "Central utility module providing CONFIG bootstrap, logging, storage abstraction, SQLAlchemy helpers for all tables, technical indicator computations, labeling algorithm, hashing functions, and normalization helpers.",
++      "charlie.ddl": "PostgreSQL schema definition for the `charlie` namespace covering assets, raw/normalized news, fundamentals, macro data, price windows, assembled samples, labels, distilled theses, pipeline runs, and audit logging plus indexes and materialized views.",
++      "example_sources_meta.json": "Reference JSON showing the structure of `sources_meta` payloads saved with assembled prompts.",
++      "pyproject.toml": "Project packaging and dependency manifest; pins Metaflow, pandas, SQLAlchemy, API clients, LLM SDKs, and developer tooling (pytest, black, ruff).",
++      "README.md": "Minimal project heading placeholder.",
++      "run_test.sh": "Convenience shell script for running tests (not inspected but assumed to execute pytest)."
++    },
++    "directories": {
++      "scripts": "Operational scripts: `init_db.sh` bootstraps the PostgreSQL schema, indexes, and materialized views; `verify_setup.sh` validates local environment, DB connectivity, and presence of key project files.",
++      "tests": "Pytest suite (`test_charlie_pipeline.py`) validating normalization helpers, relevance logic, bucket computation, and label generation behavior.",
++      "__pycache__": "Python bytecode caches generated during execution."
++    },
++    "undocumented_assets": [".env.local (env var overrides)", ".metaflow/ (Metaflow local state)"]
++  },
++  "features": {
++    "workflow": [
++      {
++        "name": "Ingestion",
++        "description": "Per-ticker foreach step `ingest_raw` pulls news, price, fundamentals, options, insider, analyst, and macro data for configured dates, writes raw JSON files under DATA_ROOT, and persists raw tables via SQLAlchemy helpers.",
++        "entry_points": ["metaflow run: python charlie_tr1_flow.py run"],
++        "dependencies": ["charlie_fetchers", "charlie_utils.storage", "CONFIG API keys"],
++        "state": {
++          "filesystem": "raw/{source}/{ticker}/{date}/*.json manifests",
++          "database": ["charlie.raw_news", "charlie.raw_news_alt", "charlie.raw_fmp_fundamentals", "charlie.raw_eodhd_options", "charlie.insider_txn", "charlie.analyst_reco", "charlie.raw_eodhd_economic_events"],
++          "artifacts": "Metaflow artifacts per branch include manifests, normalization stats, and assembled sample IDs."
++        }
++      },
++      {
++        "name": "Normalization",
++        "description": "`normalize_dedupe` reads raw_news/_alt rows, computes content hashes, normalizes timestamps, assigns recency buckets, relevance filters, and upserts `normalized_news` with dedupe audit logging.",
++        "dependencies": ["compute_content_hash", "normalize_to_utc", "compute_bucket", "check_relevance", "write_audit", "upsert_normalized_news"],
++        "state": {"database": ["charlie.normalized_news", "charlie.audit_log"], "metrics": "Normalization stats logged per ticker."}
++      },
++      {
++        "name": "Technicals",
++        "description": "`compute_technicals` loads price windows, derives TA indicators via `compute_technical_indicators`, and upserts enriched technical JSON along with normalized files.",
++        "dependencies": ["pandas", "ta library if available", "insert_price_window"],
++        "state": {"database": ["charlie.price_window"], "filesystem": "normalized/price_window/{ticker}/{date}/technicals_*.json"}
++      },
++      {
++        "name": "Sample Assembly",
++        "description": "`assemble_samples` aggregates modalities by as_of_date, enforces quotas, composes prompt text, truncates to token budget, writes assembled prompt JSON, and inserts `assembled_sample` rows with rich sources metadata.",
++        "dependencies": ["CONFIG.ASSEMBLY_QUOTAS", "truncate_text_for_budget", "insert_assembled_sample", "storage.save_obj_and_record"],
++        "state": {"filesystem": "assembled/{ticker}/{date}/prompt_var*.json", "database": ["charlie.assembled_sample"]}
++      },
++      {
++        "name": "Labeling",
++        "description": "`generate_labels` reconstructs price series, computes forward-return quantile labels via `compute_labels_for_asset`, and upserts `sample_label` entries.",
++        "dependencies": ["pandas", "compute_labels_for_asset", "insert_sample_label"],
++        "state": {"database": ["charlie.sample_label"]}
++      },
++      {
++        "name": "LLM Distillation",
++        "description": "`distill_theses` samples assembled prompts, batches them through OpenAI with Claude fallback (`run_llm_distillation_batch`), stores thesis JSON artifacts, and persists `distilled_thesis` records.",
++        "dependencies": ["CONFIG.LLM", "run_llm_distillation_batch", "insert_distilled_thesis"],
++        "state": {"filesystem": "distilled_theses/{ticker}/thesis_sample_*.json", "database": ["charlie.distilled_thesis"]}
++      },
++      {
++        "name": "Parquet Export",
++        "description": "`export_parquet` joins assembled samples with labels and theses, validates schema, emits Snappy parquet partitions with checksum and _SUCCESS markers for downstream consumption.",
++        "dependencies": ["pandas", "sha256_hash", "CONFIG.DATA_ROOT"],
++        "state": {"filesystem": "exports/parquet/{ticker}/charlie_{ticker}_run*_*.parquet", "database": "run_meta artifacts updated"}
++      },
++      {
++        "name": "Run Finalization",
++        "description": "`join_all` aggregates artifacts from foreach branches, updates pipeline run metadata, and `end` marks run completed while refreshing materialized views.",
++        "dependencies": ["write_pipeline_run_to_db", "get_db_engine", "charlie.refresh_all_materialized_views"],
++        "state": {"database": ["charlie.pipeline_run"]}
++      }
++    ],
++    "auxiliary": {
++      "testing": "Pytest cases exercise hashing, bucket logic, relevance filters, and label algorithm ensuring helper reliability.",
++      "database_bootstrap": "`scripts/init_db.sh` applies DDL, creates performance indexes, materialized views, and refresh function with connection checks.",
++      "environment_verification": "`scripts/verify_setup.sh` confirms Python, uv, PostgreSQL availability, tests DB connectivity, and reports missing project assets."
++    }
++  },
++  "components": {
++    "metaflow_steps": {
++      "start": {
++        "responsibility": "Validate configuration, compute ticker/date ranges, prepare directories, insert pipeline_run row, fan out foreach per ticker.",
++        "inputs": {
++          "parameters": ["tickers", "start_date", "end_date", "as_of_date", "seed", "variation_count", "token_budget"],
++          "config_keys": ["DATA_ROOT", "DB_URL"]
++        },
++        "outputs": {
++          "artifacts": ["ticker_list", "date_list", "run_meta", "run_id", "raw_dir", "assembled_dir", "exports_dir"],
++          "next": "ingest_raw foreach"
++        },
++        "error_handling": "Wraps DB write in try/except, logs but continues without run_id on failure."
++      },
++      "ingest_raw": {
++        "responsibility": "Parallel ticker ingestion, API fetch, file persistence, DB inserts across modalities, manifest creation.",
++        "inputs": {
++          "props": ["self.input ticker", "date_list", "CONFIG API keys"],
++          "dependencies": ["fetch_finnhub_news", "fetch_google_news", "fetch_newsapi_alt", "fetch_yahoo_ohlcv", "fetch_fmp_fundamentals", "fetch_eodhd_options", "fetch_insider_transactions", "fetch_analyst_recommendations", "fetch_eodhd_econ_events", "fetch_edgar_filings"]
++        },
++        "state_transitions": "Creates asset if missing, populates raw tables, files, manifest path artifact.",
++        "error_handling": "Wraps each fetch block in try/except with logger.exception; fallback stubs for unimplemented sources; handles DB insert failures individually."
++      },
++      "normalize_dedupe": {
++        "responsibility": "Apply dedupe, relevance, bucket logic to populate normalized_news with audit tracking.",
++        "inputs": {
++          "props": ["asset_id", "date_list"],
++          "config": ["check_relevance heuristics"],
++          "db": "raw_news/_alt"
++        },
++        "state_transitions": "Upserts normalized rows, writes audits for duplicates/quality issues, records stats artifact.",
++        "error_handling": "Counts quality failures, logs normalization exceptions, handles duplicate key errors explicitly."
++      },
++      "compute_technicals": {
++        "responsibility": "Compute technical indicators and persist updated price windows and normalized JSON files.",
++        "inputs": {"props": ["price_window rows"]},
++        "state_transitions": "Upserts charlie.price_window technicals, writes normalized files.",
++        "error_handling": "Logs per-row failures but continues."
++      },
++      "assemble_samples": {
++        "responsibility": "Aggregate modalities, sample news, build prompt text, store assembled samples and metadata.",
++        "inputs": {
++          "props": ["CONFIG quotas", "seed", "variation_count"],
++          "db": ["price_window", "normalized_news", "raw_fmp_fundamentals", "raw_eodhd_options", "raw_eodhd_economic_events", "insider_txn", "analyst_reco"]
++        },
++        "state_transitions": "Writes prompt JSON, inserts assembled_sample rows, tracks sample IDs.",
++        "error_handling": "Catches DB fetch errors per modality, logs warnings; ensures prompt saving even if some modalities missing."
++      },
++      "generate_labels": {
++        "responsibility": "Compute forward-return quantile labels and persist sample_label rows.",
++        "inputs": {
++          "props": ["assembled_sample_ids"],
++          "db": "price_window"
++        },
++        "state_transitions": "Upserts charlie.sample_label, stores stats artifact.",
++        "error_handling": "Skips when price data absent or labels invalid; logs exceptions per sample."
++      },
++      "distill_theses": {
++        "responsibility": "Batch prompts through LLM pipeline, persist thesis outputs.",
++        "inputs": {
++          "props": ["assembled samples"],
++          "config": "CONFIG.LLM"
++        },
++        "state_transitions": "Writes thesis files, updates charlie.distilled_thesis.",
++        "error_handling": "Catch LLM failures, fall back to stub theses, logs exceptions."
++      },
++      "export_parquet": {
++        "responsibility": "Assemble final dataset, validate, export parquet, compute checksum, set success markers, update run artifacts.",
++        "inputs": {
++          "db": ["assembled_sample", "sample_label", "distilled_thesis"]
++        },
++        "state_transitions": "Writes parquet/checksum/_SUCCESS, appends to run_meta artifacts.",
++        "error_handling": "Skips export when no rows, handles missing columns, logs null counts."
++      },
++      "join_all": {
++        "responsibility": "Merge run metadata from foreach branches and finalize pipeline_run.",
++        "inputs": {"artifacts": "branch run_meta/run_id"},
++        "state_transitions": "Updates pipeline_run row with aggregated artifacts, set status success.",
++        "error_handling": "Initializes default run_meta if missing, catches aggregation errors."
++      },
++      "end": {
++        "responsibility": "Mark pipeline_run completed and refresh materialized views.",
++        "inputs": {
++          "props": ["run_id"],
++          "db": "get_db_engine"
++        },
++        "state_transitions": "Updates pipeline_run status, invokes refresh function.",
++        "error_handling": "Logs exceptions during DB update or refresh without stopping pipeline."
++      }
++    },
++    "helpers": {
++      "storage_backend": {
++        "local": "`LocalStorage` writes JSON beneath CONFIG.DATA_ROOT, ensures directories exist, and supports listing for maintenance.",
++        "s3_stub": "`S3Storage` placeholder raises NotImplementedError; indicates future S3 support path."
++      },
++      "database_helpers": {
++        "engine": "`get_db_engine` returns SQLAlchemy engine bound to CONFIG.DB_URL, enabling scoped connections in steps.",
++        "write_pipeline_run_to_db": "Inserts pipeline_run records returning run_id, used at start and join_all for audit trail.",
++        "insert_functions": "Dedicated insert/upsert helpers for each table (`insert_raw_news`, `insert_price_window`, etc.) encapsulate SQL, handle JSON serialization, and enforce idempotency via ON CONFLICT or update-first patterns.",
++        "audit": "`write_audit` records dedupe/quality actions into audit_log for traceability."
++      },
++      "fetchers": {
++        "retry_strategy": "All network fetchers decorated with tenacity retry (3 attempts, exponential backoff, optional exception filters).",
++        "rate_limiting": "Each fetch imposes `CONFIG.RATE_LIMIT_DELAY` sleep to respect vendor quotas.",
++        "provider_notes": {
++          "fetch_yahoo_ohlcv": "Uses yfinance, returns last 15 trading days, warns if empty.",
++          "fetch_finnhub_news": "Requires FINNHUB_API_KEY, maps to pipeline news schema, rate-limits, converts epoch timestamps.",
++          "fetch_newsapi_alt": "Respects NewsAPI 30-day window, logs skip if date too old.",
++          "fetch_google_news": "Calls SerpAPI, attempts flexible datetime parsing.",
++          "fetch_fmp_fundamentals": "Hits FMP v4 with fallback to v3, builds normalized payload, warns on API errors.",
++          "fetch_eodhd_options": "Skips historical requests unless same-day (premium requirement) and returns present chain.",
++          "fetch_eodhd_econ_events": "Queries economic calendar for date range and returns basic fields.",
++          "fetch_insider_transactions": "Filters future filings, maps transaction metadata.",
++          "fetch_analyst_recommendations": "Filters future dates, records rating transitions.",
++          "fetch_edgar_filings": "Stub logging placeholder for future SEC integration.",
++          "run_llm_distillation_batch": "Orchestrates OpenAI primary call per prompt with Claude fallback; returns stub theses on failure; includes heuristics to parse structured sections."
++        }
++      },
++      "data_transforms": {
++        "compute_technical_indicators": "Generates RSI, MACD, Bollinger Bands, ATR, EMA/SMA, optional Ichimoku, with safe float casting and fallback when `ta` missing.",
++        "compute_labels_for_asset": "Implements Algorithm S1: EMA3 returns, volatility normalization, weighted composite signal, asymmetric quantiles mapping to classes 1-5, returns DataFrame with signals/labels/quantiles.",
++        "compute_bucket": "Buckets articles into recency windows relative to as_of_date for prompt stratification.",
++        "check_relevance": "Heuristic requiring ticker or company name plus minimum text length to mark news as relevant."
++      }
++    }
++  },
++  "state_management": {
++    "metaflow": "FlowSpec artifacts store per-step stats, manifest paths, assembled sample IDs, and normalization metrics for run introspection.",
++    "database_tables": {
++      "asset": "Master asset registry keyed by ticker; populated lazily via `upsert_asset` during ingestion.",
++      "raw_tables": [
++        "raw_news",
++        "raw_news_alt",
++        "raw_fmp_fundamentals",
++        "raw_eodhd_options",
++        "insider_txn",
++        "analyst_reco",
++        "raw_eodhd_economic_events"
++      ],
++      "normalized_and_feature": [
++        "normalized_news",
++        "price_window",
++        "assembled_sample",
++        "sample_label",
++        "distilled_thesis"
++      ],
++      "metadata": [
++        "pipeline_run",
++        "audit_log",
++        "materialized views (label_distribution, source_summary, pipeline_run_summary, data_quality_summary)"
++      ]
++    },
++    "filesystem_layout": {
++      "root": "CONFIG.DATA_ROOT (default /opt/charlie_data)",
++      "raw": "raw/{source}/{ticker}/{date}/*.json plus manifests",
++      "normalized": "normalized/price_window/... for technicals",
++      "assembled": "assembled/{ticker}/{as_of_date}/prompt_var*.json",
++      "labels": "labels/ placeholder for future label exports",
++      "distilled_theses": "distilled_theses/{ticker}/thesis_sample_*.json",
++      "exports": "exports/parquet/{ticker}/charlie_{ticker}_run*.parquet with .sha256 and _SUCCESS"
++    },
++    "state_transitions": "Pipeline progresses from raw ingestion -> normalized dedupe -> technical enrichment -> assembled prompts -> labels -> distilled theses -> parquet exports, with each stage persisting to DB and filesystem, enabling recovery/resume via underlying tables.",
++    "selectors": "Database queries within steps filter by asset_id + as_of_date, ensuring deterministic rebuilds and enabling ad-hoc analytics via SQL or parquet outputs."
++  },
++  "infrastructure": {
++    "environment": "Config loads from .env.local via python-dotenv, enabling overrides for DB URL, data root, API keys, quotas, and LLM settings.",
++    "database_setup": "`scripts/init_db.sh` applies schema, additional indexes (GIN, hash, composite), creates materialized views and refresh function, verifies counts.",
++    "verification": "`scripts/verify_setup.sh` ensures Python3, uv, PostgreSQL availability, tests DB connectivity, reports missing key files, suggests next steps.",
++    "build_config": "pyproject uses Hatch build backend; dependencies include Metaflow, pandas, pyarrow, fastparquet, yfinance, finnhub, fredapi, openai, anthropic, Tenacity, and dev extras for linting/testing.",
++    "testing": "Tests executed via pytest (see `tests/test_charlie_pipeline.py`); CI not defined but run_test.sh expected to trigger pytest.",
++    "metaflow_requirements": "Local mode without S3 datastore; batch decorators commented out for future cloud execution."
++  },
++  "security": {
++    "secrets_handling": "API keys sourced from environment variables (FINNHUB_API_KEY, FMP_API_KEY, EODHD_API_KEY, etc.); .env.local untracked ensures credentials remain local.",
++    "network_calls": "HTTP requests dispatched over requests/yfinance clients; retries with exponential backoff mitigate transient failures.",
++    "llm_usage": "OpenAI/Anthropic keys read from CONFIG, fallback path handles unavailable providers with stub outputs to avoid leaking secrets.",
++    "data_privacy": "Raw JSON stored locally; dedupe hashes rely on SHA256; no encryption applied by default—consider securing DATA_ROOT for sensitive data."
++  },
++  "performance": {
++    "parallelism": "Metaflow `foreach` over tickers enables parallel ingestion; variation sampling uses deterministic seeds to balance load.",
++    "retry_and_resilience": "Tenacity retries protect external API calls; ingestion continues despite individual source failures via try/except guards.",
++    "batching": "LLM distillation processes prompts in configurable batches (`CONFIG.LLM.batch_size`) with optional sampling to limit costs.",
++    "database_indexes": "DDL plus init script create indexes (hash, composite, GIN) and materialized views to accelerate downstream analytics.",
++    "file_outputs": "Parquet exports compressed with Snappy; checksums provide integrity verification."
++  },
++  "testing": {
++    "unit": "`tests/test_charlie_pipeline.py` covers content hashing, bucket logic, relevance heuristics, label computation edge cases, timezone normalization, and import sanity checks.",
++    "execution": "Pytest configuration (pyproject) runs with coverage and verbose output via `python -m pytest` or `run_test.sh`."
++  },
++  "api_dependencies": {
++    "market_data": [
++      "Yahoo Finance via yfinance",
++      "Finnhub company news",
++      "Financial Modeling Prep fundamentals/insider/analyst",
++      "EODHD options & economic events",
++      "SimFin fundamentals"
++    ],
++    "news": ["SerpAPI Google News", "NewsAPI alt sources"],
++    "macro": ["FRED API"],
++    "llm_providers": ["OpenAI", "Anthropic (fallback)"],
++    "notes": "fetch_edgar_filings is stubbed and logs TODO for SEC integration; historical EODHD options require premium subscription (skipped otherwise)."
++  }
++}
+ {
+   "version": 1,
+   "generated_at": "2025-10-19T00:00:00Z",
+diff --git a/README.md b/README.md
+index 53201c7..62c7651 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,321 @@
+-# TradingCharlie
+-a data pipeline for stock market analysis
++# Charlie-TR1-DB: Multi-Modal Financial Forecasting Dataset Pipeline
++
++A reproducible, end-to-end data pipeline for building multi-modal financial forecasting datasets using Metaflow for orchestration, PostgreSQL for structured metadata, and local filesystem storage for artifacts.
++
++## 📋 Overview
++
++This pipeline assembles financial market data from multiple sources into training-ready datasets for machine learning models. The system combines:
++
++- **News sources**: Finnhub, Google News, NewsAPI, GDELT
++- **Market data**: Yahoo Finance (OHLCV), EODHD options
++- **Fundamentals**: Financial Modeling Prep (FMP), SimFin
++- **Macro data**: FRED economic series, EODHD economic events
++- **Technical indicators**: RSI, MACD, EMA, ATR, Bollinger Bands, Ichimoku
++- **Label generation**: Volatility-adjusted composite signals (Algorithm S1)
++- **LLM distillation**: Optional thesis generation for samples
++
++## 🚀 Quick Start
++
++### Prerequisites
++
++- Python 3.10+
++- PostgreSQL 12+
++- [UV](https://github.com/astral-sh/uv) package manager
++- API keys for data sources (see Configuration section)
++
++### Installation
++
++```bash
++# Clone or navigate to the project directory
++cd /opt/T1
++
++# Create UV virtual environment
++uv venv
++
++# Activate the environment
++source .venv/bin/activate  # On Linux/Mac
++# or
++.venv\Scripts\activate  # On Windows
++
++# Install dependencies
++uv pip install -e .
++```
++
++### Database Setup
++
++The database has already been initialized with the `charlie` schema. If you need to reinitialize:
++
++```bash
++# The database is ready with:
++# - Database: charlie
++# - User: charlie
++# - Password: charliepass
++# - Schema: charlie (with all tables, indexes, and views)
++
++# To verify:
++psql -h localhost -U charlie -d charlie -c "SELECT COUNT(*) FROM charlie.asset;"
++```
++
++### Configuration
++
++#### Option 1: Using .env file (Recommended)
++
++1. Copy the example environment file:
++   ```bash
++   cp .env.example .env
++   ```
++
++2. Edit `.env` with your actual API keys:
++   ```bash
++   nano .env
++   ```
++
++3. Load environment variables:
++   ```bash
++   source load_env.sh
++   ```
++
++#### Option 2: Manual export
++
++Set the following environment variables for API access:
++
++```bash
++# Data storage
++export CHARLIE_DATA_ROOT="/opt/charlie_data"
++
++# Database (defaults are already set)
++export CHARLIE_DB_URL="postgresql+psycopg2://charlie:charliepass@localhost:5432/charlie"
++
++# API Keys (required for real data fetching)
++export FINNHUB_API_KEY="your_finnhub_key"
++export FMP_API_KEY="your_fmp_key"
++export EODHD_API_KEY="your_eodhd_key"
++export FRED_API_KEY="your_fred_key"
++export NEWSAPI_KEY="your_newsapi_key"
++export SIMFIN_API_KEY="your_simfin_key"
++
++# Optional: LLM for thesis distillation
++export CHARLIE_LLM_PROVIDER="openai"
++export CHARLIE_LLM_API_KEY="your_openai_key"
++export CHARLIE_LLM_MODEL="gpt-4o-mini"
++```
++
++#### API Key Sources
++
++- **Finnhub**: https://finnhub.io/register (Free: 60 calls/minute)
++- **FRED**: https://fred.stlouisfed.org/docs/api/api_key.html (Free: Usually no limits)
++- **FMP**: https://financialmodelingprep.com/developer/docs (Free: 250 calls/day)
++- **EODHD**: https://eodhd.com/ (Free: 20 calls/day)
++- **NewsAPI**: https://newsapi.org/register (Free: 1000 requests/day)
++- **SimFin**: https://simfin.com/ (Free: Limited access)
++- **OpenAI**: https://platform.openai.com/api-keys (Paid service)
++
++### Running the Pipeline
++
++```bash
++# Single date run for one ticker
++python charlie_tr1_flow.py run \
++  --tickers AAPL \
++  --as_of_date 2024-01-15 \
++  --variation_count 20
++
++# Multiple tickers over date range
++python charlie_tr1_flow.py run \
++  --tickers AAPL,NVDA,MSFT \
++  --start_date 2024-01-01 \
++  --end_date 2024-12-31 \
++  --variation_count 20 \
++  --seed 1234
++```
++
++## 📁 Project Structure
++
++```
++/opt/T1/
++├── charlie_tr1_flow.py      # Main Metaflow pipeline
++├── charlie.ddl               # Database schema definition
++├── pyproject.toml            # UV project configuration
++├── .python-version           # Python version for UV
++├── README.md                 # This file
++├── scripts/
++│   └── init_db.sh           # Database initialization script
++└── example_sources_meta.json # Example metadata format
++
++/opt/charlie_data/            # Data storage root (created on first run)
++├── raw/                      # Raw API responses
++│   ├── finnhub/
++│   ├── google_news/
++│   ├── yahoo_price/
++│   ├── fmp/
++│   └── eodhd_options/
++├── normalized/               # Cleaned and deduplicated data
++│   ├── news/
++│   ├── price_window/
++│   └── ...
++├── assembled/                # Prompt variations per (ticker, date)
++├── labels/                   # Computed labels (Algorithm S1)
++├── distilled_theses/         # LLM-generated reasoning
++└── exports/
++    └── parquet/              # Final dataset exports
++```
++
++## 🏗️ Pipeline Architecture
++
++The Metaflow pipeline consists of the following steps:
++
++### 1. **start**
++- Validates parameters
++- Creates storage directories
++- Initializes pipeline_run database record
++- Parallelizes by ticker
++
++### 2. **ingest_raw**
++- Fetches data from all configured APIs
++- Stores raw JSON files
++- Inserts metadata into PostgreSQL
++- Implements rate limiting and retry logic
++
++### 3. **normalize_dedupe**
++- Deduplicates news articles by hash
++- Normalizes timestamps to UTC
++- Buckets news by temporal distance (0-3, 4-10, 11-30 days)
++- Estimates token counts
++
++### 4. **compute_technicals**
++- Computes technical indicators using `ta` library
++- Generates 15-day OHLCV windows
++- Stores indicators in price_window table
++
++### 5. **assemble_samples**
++- Creates N variations per (ticker, date)
++- Samples from available modalities
++- Assembles prompts within token budget
++- Records sources_meta for provenance
++
++### 6. **generate_labels**
++- Implements Algorithm S1 from research paper
++- Computes forward returns at τ ∈ {3, 7, 15} days
++- Normalizes by rolling volatility
++- Quantizes into 5 classes
++
++### 7. **distill_theses**
++- Optional LLM distillation step
++- Batch processes prompts
++- Generates reasoning/thesis text
++- Stores results with source model info
++
++### 8. **export_parquet**
++- Joins assembled_sample + sample_label + distilled_thesis
++- Exports to Parquet format
++- Partitions by ticker
++
++## 📊 Database Schema
++
++### Core Tables
++- `asset` - Ticker symbols and company metadata
++- `raw_news` - Primary news sources (Finnhub, Google News)
++- `raw_news_alt` - Alternative news (NewsAPI, GDELT, Webz)
++- `price_window` - OHLCV data with technical indicators
++- `raw_fmp_fundamentals` - FMP financial statements
++- `raw_eodhd_options` - Options chain data
++- `raw_eodhd_economic_events` - Economic calendar
++- `insider_txn` - Insider trading transactions
++- `analyst_reco` - Analyst recommendations
++- `macro_series` - FRED economic series
++- `assembled_sample` - Generated prompt variations
++- `sample_label` - Computed labels (Algorithm S1)
++- `distilled_thesis` - LLM-generated reasoning
++- `pipeline_run` - Pipeline execution metadata
++- `audit_log` - System audit trail
++
++### Materialized Views
++- `label_distribution` - Label statistics by asset/date
++- `source_summary` - Data source coverage summary
++- `pipeline_run_summary` - Pipeline execution history
++
++Refresh views with:
++```sql
++SELECT charlie.refresh_all_materialized_views();
++```
++
++## 🔍 Querying the Data
++
++```sql
++-- Check pipeline runs
++SELECT * FROM charlie.pipeline_run_summary ORDER BY started_at DESC LIMIT 10;
++
++-- View assembled samples for a ticker
++SELECT sample_id, as_of_date, variation_id, prompt_tokens
++FROM charlie.assembled_sample a
++JOIN charlie.asset ast ON a.asset_id = ast.asset_id
++WHERE ast.ticker = 'AAPL'
++ORDER BY as_of_date DESC, variation_id
++LIMIT 20;
++
++-- Label distribution
++SELECT * FROM charlie.label_distribution
++WHERE ticker = 'AAPL'
++ORDER BY as_of_date DESC, label_class;
++
++-- Check data coverage
++SELECT * FROM charlie.source_summary
++WHERE ticker IN ('AAPL', 'NVDA')
++ORDER BY as_of_date DESC;
++```
++
++## 🧪 Testing
++
++```bash
++# Test database connection
++psql -h localhost -U charlie -d charlie -c "SELECT COUNT(*) FROM charlie.asset;"
++
++# Test single-ticker pipeline (when APIs are implemented)
++python charlie_tr1_flow.py run \
++  --tickers AAPL \
++  --as_of_date 2024-06-01 \
++  --variation_count 5
++
++# Verify output
++ls -lah /opt/charlie_data/exports/parquet/AAPL/
++```
++
++## 📝 Data Provenance
++
++Every assembled sample includes `sources_meta` JSON tracking:
++```json
++{
++  "news": {"count": 10, "sources": ["finnhub", "google_news"]},
++  "news_alt": {"count": 4, "sources": ["gdelt", "newsapi"]},
++  "technicals": {"window_days": 15, "indicators": ["RSI", "MACD", "EMA", "ATR"]},
++  "fundamentals": {"sources": ["simfin", "fmp"], "latest_report": "2024-12-31"},
++  "macro": {"sources": ["fred", "eodhd"], "series_included": ["CPI", "GDP", "FEDFUNDS"]},
++  "insider": {"transactions": 12, "mspr": 0.34},
++  "analyst": {"count": 8, "mean_rating": "Buy"},
++  "options": {"included": true, "records": 20, "avg_iv": 0.28},
++  "distillation": {"included": true, "model": "gpt-4o-mini"}
++}
++```
++
++## 🚀 Future Enhancements
++
++- Implement S3Storage backend for cloud storage
++- Deploy on AWS Batch with Metaflow
++- Add real-time ingestion pipeline
++- Support incremental updates
++- Integrate with model training workflows
++- Add monitoring and alerting
++- Implement automated backups
++
++## 📄 License
++
++[Specify your license]
++
++## 👥 Contributors
++
++[List contributors]
++
++## 📚 References
++
++- Product Requirements Document: `/opt/T1/data_flow_design.md`
++- Database Schema: `/opt/T1/charlie.ddl`
++- Example Metadata: `/opt/T1/example_sources_meta.json`
+\ No newline at end of file
+diff --git a/charlie_fetchers.py b/charlie_fetchers.py
+index 3271464..6190d88 100644
+--- a/charlie_fetchers.py
++++ b/charlie_fetchers.py
+@@ -167,8 +167,9 @@ def fetch_fmp_fundamentals(ticker: str, start_date: date, api_key: str) -> List[
+     """
+     Fetch financial statements from Financial Modeling Prep.
+     Returns list of financial reports.
+-    
+-    NOTE: FMP v3 endpoints may require paid subscription. Free tier has limitations.
++
++    NOTE: Updated to use /stable/ API endpoints (legacy v3/v4 deprecated August 31, 2025)
++    Free tier limited to US stocks. International stocks require premium subscription.
+     """
+     if not api_key:
+         logger.debug(f"FMP API key not configured, skipping fundamentals for {ticker}")
+@@ -177,26 +178,30 @@ def fetch_fmp_fundamentals(ticker: str, start_date: date, api_key: str) -> List[
+     try:
+         logger.debug(f"Fetching FMP fundamentals for {ticker}")
+ 
+-        # Try v4 endpoint first (more likely to work with free tier)
+-        url = f"https://financialmodelingprep.com/api/v4/income-statement/{ticker}"
+-        params = {"apikey": api_key, "limit": 8}  # Get last 2 years (quarterly)
++        # Use new stable API endpoint (symbol as query parameter)
++        url = "https://financialmodelingprep.com/stable/income-statement"
++        params = {"symbol": ticker, "apikey": api_key, "limit": 8}  # Get last 2 years (quarterly)
+ 
+         response = requests.get(url, params=params, timeout=30)
+-        
+-        # If v4 fails, try v3 as fallback
+-        if response.status_code == 403 or response.status_code == 404:
+-            logger.debug(f"FMP v4 failed, trying v3 for {ticker}")
+-            url = f"https://financialmodelingprep.com/api/v3/income-statement/{ticker}"
+-            response = requests.get(url, params=params, timeout=30)
+-        
++
++        # Handle premium/subscription errors (402)
++        if response.status_code == 402:
++            logger.warning(f"FMP fundamentals for {ticker} requires premium subscription (402)")
++            return []
++
+         response.raise_for_status()
+         data = response.json()
+-        
++
+         # Check if response is an error message (FMP returns JSON even for errors)
+         if isinstance(data, dict) and 'Error Message' in data:
+             logger.warning(f"FMP API returned error for {ticker}: {data['Error Message']}")
+             return []
+ 
++        # Handle empty response
++        if not data or (isinstance(data, list) and len(data) == 0):
++            logger.info(f"No financial data available for {ticker}")
++            return []
++
+         time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
+ 
+         results = []
+@@ -218,6 +223,12 @@ def fetch_fmp_fundamentals(ticker: str, start_date: date, api_key: str) -> List[
+         logger.info(f"Fetched {len(results)} financial reports from FMP for {ticker}")
+         return results
+ 
++    except requests.exceptions.HTTPError as e:
++        if e.response.status_code == 402:
++            logger.warning(f"FMP fundamentals for {ticker} requires premium subscription")
++        else:
++            logger.error(f"FMP fundamentals HTTP error for {ticker}: {e}")
++        return []
+     except Exception as e:
+         logger.error(f"FMP fundamentals fetch failed for {ticker}: {e}")
+         return []
+@@ -314,7 +325,12 @@ def fetch_google_news(ticker: str, as_of_date: date, api_key: str) -> List[Dict[
+         results = []
+         for article in data.get('news_results', []):
+             # Parse date if available - Google News returns various formats
++            # Note: SerpAPI nests the date inside the article structure
+             pub_date_str = article.get('date', '')
++            if not pub_date_str:
++                # Try getting date from the nested structure if not at top level
++                pub_date_str = article.get('raw_json', {}).get('date', '')
++
+             pub_date = None
+             if pub_date_str:
+                 try:
+@@ -322,17 +338,45 @@ def fetch_google_news(ticker: str, as_of_date: date, api_key: str) -> List[Dict[
+                     from dateutil import parser
+                     pub_date = parser.parse(pub_date_str)
+                 except:
+-                    # If parsing fails, leave as None
+-                    logger.debug(f"Could not parse date: {pub_date_str}")
+-                    pub_date = None
+-            
++                    # Try parsing SerpAPI specific format: "10/19/2025, 10:46 AM, +0000 UTC"
++                    try:
++                        from datetime import datetime
++                        # Remove the timezone part and parse as naive datetime
++                        if ', +0000 UTC' in pub_date_str:
++                            # Format: "MM/DD/YYYY, HH:MM AM/PM, +0000 UTC"
++                            date_part = pub_date_str.replace(', +0000 UTC', '')
++                            pub_date = datetime.strptime(date_part, '%m/%d/%Y, %I:%M %p')
++                        else:
++                            logger.debug(f"Could not parse date: {pub_date_str}")
++                    except:
++                        logger.debug(f"Could not parse date: {pub_date_str}")
++                        pub_date = None
++
++            # Create a copy of article for raw_json storage, ensuring no datetime objects
++            import json
++            # Convert to JSON and back to remove datetime objects
++            try:
++                raw_json_copy = json.loads(json.dumps(article, default=str))
++            except:
++                # Fallback: remove known datetime fields
++                raw_json_copy = article.copy()
++                # Remove any datetime objects recursively
++                def remove_datetimes(obj):
++                    if isinstance(obj, dict):
++                        return {k: remove_datetimes(v) for k, v in obj.items() if not isinstance(v, datetime)}
++                    elif isinstance(obj, list):
++                        return [remove_datetimes(item) for item in obj]
++                    else:
++                        return obj
++                raw_json_copy = remove_datetimes(raw_json_copy)
++
+             results.append({
+                 "headline": article.get('title', ''),
+                 "snippet": article.get('snippet', ''),
+                 "url": article.get('link', ''),
+                 "published_at": pub_date,
+                 "source": article.get('source', {}).get('name', 'google_news') if isinstance(article.get('source'), dict) else 'google_news',
+-                "raw_json": article
++                "raw_json": raw_json_copy
+             })
+ 
+         logger.info(f"Fetched {len(results)} articles from Google News for {ticker}")
+@@ -500,6 +544,9 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
+     """
+     Fetch insider trading transactions from FMP API.
+     Returns list of insider transactions up to as_of_date.
++
++    NOTE: Updated to use /stable/ API endpoints (legacy v3/v4 deprecated August 31, 2025)
++    Insider trading data may require premium subscription or may not be available on free tier.
+     """
+     if not api_key:
+         logger.debug(f"FMP API key not configured, skipping insider transactions for {ticker}")
+@@ -508,17 +555,30 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
+     try:
+         logger.debug(f"Fetching insider transactions for {ticker} up to {as_of_date}")
+ 
+-        url = f"https://financialmodelingprep.com/api/v4/insider-trading"
+-        params = {
+-            "symbol": ticker,
+-            "apikey": api_key,
+-            "limit": 50  # Get last 50 transactions
+-        }
++        # Use new stable API endpoint (may not support symbol filtering on free tier)
++        url = "https://financialmodelingprep.com/stable/insider-trading"
++        params = {"apikey": api_key, "limit": 100}  # Get more transactions, filter client-side
+ 
+         response = requests.get(url, params=params, timeout=30)
++
++        # Handle premium/subscription errors (402)
++        if response.status_code == 402:
++            logger.warning(f"FMP insider transactions for {ticker} requires premium subscription (402)")
++            return []
++
+         response.raise_for_status()
+         data = response.json()
+ 
++        # Check if response is an error message (FMP returns JSON even for errors)
++        if isinstance(data, dict) and 'Error Message' in data:
++            logger.warning(f"FMP API returned error for insider transactions: {data['Error Message']}")
++            return []
++
++        # Handle empty response
++        if not data or (isinstance(data, list) and len(data) == 0):
++            logger.info(f"No insider transaction data available (may require premium subscription)")
++            return []
++
+         time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
+ 
+         results = []
+@@ -535,6 +595,11 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
+             except:
+                 continue
+ 
++            # Filter by ticker if available in response (may not be present in stable API)
++            txn_symbol = txn.get('symbol', '').upper()
++            if txn_symbol and txn_symbol != ticker.upper():
++                continue  # Skip transactions for other tickers
++
+             results.append({
+                 "filing_date": filing_date_str.split('T')[0],
+                 "transaction_type": txn.get('transactionType', ''),
+@@ -548,6 +613,12 @@ def fetch_insider_transactions(ticker: str, as_of_date: date, api_key: str) -> L
+         logger.info(f"Fetched {len(results)} insider transactions from FMP for {ticker}")
+         return results
+ 
++    except requests.exceptions.HTTPError as e:
++        if e.response.status_code == 402:
++            logger.warning(f"FMP insider transactions for {ticker} requires premium subscription")
++        else:
++            logger.error(f"FMP insider transactions HTTP error for {ticker}: {e}")
++        return []
+     except Exception as e:
+         logger.error(f"FMP insider transactions fetch failed for {ticker}: {e}")
+         return []
+@@ -557,6 +628,9 @@ def fetch_analyst_recommendations(ticker: str, as_of_date: date, api_key: str) -
+     """
+     Fetch analyst recommendations from FMP API.
+     Returns list of analyst ratings up to as_of_date.
++
++    NOTE: Updated to use /stable/ API endpoints (legacy v3/v4 deprecated August 31, 2025)
++    Free tier limited to US stocks. International stocks require premium subscription.
+     """
+     if not api_key:
+         logger.debug(f"FMP API key not configured, skipping analyst recommendations for {ticker}")
+@@ -565,16 +639,30 @@ def fetch_analyst_recommendations(ticker: str, as_of_date: date, api_key: str) -
+     try:
+         logger.debug(f"Fetching analyst recommendations for {ticker} up to {as_of_date}")
+ 
+-        url = f"https://financialmodelingprep.com/api/v3/grade/{ticker}"
+-        params = {
+-            "apikey": api_key,
+-            "limit": 20
+-        }
++        # Use new stable API endpoint (symbol as query parameter)
++        url = "https://financialmodelingprep.com/stable/grades"
++        params = {"symbol": ticker, "apikey": api_key, "limit": 20}
+ 
+         response = requests.get(url, params=params, timeout=30)
++
++        # Handle premium/subscription errors (402)
++        if response.status_code == 402:
++            logger.warning(f"FMP analyst recommendations for {ticker} requires premium subscription (402)")
++            return []
++
+         response.raise_for_status()
+         data = response.json()
+ 
++        # Check if response is an error message (FMP returns JSON even for errors)
++        if isinstance(data, dict) and 'Error Message' in data:
++            logger.warning(f"FMP API returned error for analyst recommendations: {data['Error Message']}")
++            return []
++
++        # Handle empty response
++        if not data or (isinstance(data, list) and len(data) == 0):
++            logger.info(f"No analyst recommendation data available for {ticker}")
++            return []
++
+         time.sleep(CONFIG.get('RATE_LIMIT_DELAY', 1.0))
+ 
+         results = []
+@@ -603,6 +691,12 @@ def fetch_analyst_recommendations(ticker: str, as_of_date: date, api_key: str) -
+         logger.info(f"Fetched {len(results)} analyst recommendations from FMP for {ticker}")
+         return results
+ 
++    except requests.exceptions.HTTPError as e:
++        if e.response.status_code == 402:
++            logger.warning(f"FMP analyst recommendations for {ticker} requires premium subscription")
++        else:
++            logger.error(f"FMP analyst recommendations HTTP error for {ticker}: {e}")
++        return []
+     except Exception as e:
+         logger.error(f"FMP analyst recommendations fetch failed for {ticker}: {e}")
+         return []
+diff --git a/charlie_utils.py b/charlie_utils.py
+index eb0cdf1..1dd87a7 100644
+--- a/charlie_utils.py
++++ b/charlie_utils.py
+@@ -140,7 +140,7 @@ def validate_and_log_config():
+ 
+     logger.info("API Configuration Status:")
+     for api, available in api_status.items():
+-        status = "✓ Ready" if available else "✗ Not available"
++        status = "Ready" if available else "Not available"
+         logger.info(f"  {api}: {status}")
+ 
+     if not any(api_status.values()):
+diff --git a/run_test.sh b/run_test.sh
+old mode 100644
+new mode 100755
+index fedc0b0..03e09e2
+--- a/run_test.sh
++++ b/run_test.sh
+@@ -1,8 +1,29 @@
+ #!/bin/bash
++# run_test.sh
++#
++# Run Charlie-TR1-DB pipeline test with AAPL
++#
++# Usage:
++#   ./run_test.sh         # Run pipeline normally
++#   ./run_test.sh --clean # Clean all data first, then run pipeline
++
+ set -euo pipefail
++
++# Get script directory
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++
++# Check for --clean flag
++if [ "${1:-}" == "--clean" ]; then
++    echo "Running cleanup before pipeline..."
++    "${SCRIPT_DIR}/scripts/clean_all.sh" -y
++    echo ""
++fi
++
++# Activate virtual environment
+ source .venv/bin/activate
+ export USERNAME="charlie"
+ 
++# Run the pipeline
+ python3 charlie_tr1_flow.py run \
+     --tickers AAPL \
+     --as_of_date 2024-06-15 \

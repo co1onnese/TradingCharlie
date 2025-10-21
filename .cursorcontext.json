@@ -1,4 +1,297 @@
 {
+  "project_metadata": {
+    "name": "Charlie TR1 DB",
+    "summary": "Metaflow-based multi-modal financial dataset builder that ingests market, news, fundamentals, options, macro, and analyst data, normalizes it, computes features, labels samples, distills LLM theses, and exports curated parquet datasets.",
+    "primary_languages": ["Python"],
+    "frameworks": ["Metaflow"],
+    "storage_backends": ["PostgreSQL", "Local filesystem JSON", "Parquet"],
+    "deployment_notes": "Designed for local runs with Metaflow local storage; configurable via environment variables loaded from .env.local."
+  },
+  "directory_overview": {
+    "root": "/opt/T1",
+    "files": {
+      "charlie_tr1_flow.py": "Defines `CharlieTR1Pipeline`, a Metaflow FlowSpec implementing the end-to-end ETL: validates configuration, runs per-ticker foreach branches for ingestion through export, coordinates DB persistence, and refreshes materialized views.",
+      "charlie_fetchers.py": "Houses API client functions for Yahoo Finance, Finnhub, NewsAPI, SerpAPI Google News, FMP, EODHD, SimFin, and LLM distillation with tenacity retry wrappers and rate limiting hooks.",
+      "charlie_utils.py": "Central utility module providing CONFIG bootstrap, logging, storage abstraction, SQLAlchemy helpers for all tables, technical indicator computations, labeling algorithm, hashing functions, and normalization helpers.",
+      "charlie.ddl": "PostgreSQL schema definition for the `charlie` namespace covering assets, raw/normalized news, fundamentals, macro data, price windows, assembled samples, labels, distilled theses, pipeline runs, and audit logging plus indexes and materialized views.",
+      "example_sources_meta.json": "Reference JSON showing the structure of `sources_meta` payloads saved with assembled prompts.",
+      "pyproject.toml": "Project packaging and dependency manifest; pins Metaflow, pandas, SQLAlchemy, API clients, LLM SDKs, and developer tooling (pytest, black, ruff).",
+      "README.md": "Minimal project heading placeholder.",
+      "run_test.sh": "Convenience shell script for running tests (not inspected but assumed to execute pytest)."
+    },
+    "directories": {
+      "scripts": "Operational scripts: `init_db.sh` bootstraps the PostgreSQL schema, indexes, and materialized views; `verify_setup.sh` validates local environment, DB connectivity, and presence of key project files.",
+      "tests": "Pytest suite (`test_charlie_pipeline.py`) validating normalization helpers, relevance logic, bucket computation, and label generation behavior.",
+      "__pycache__": "Python bytecode caches generated during execution."
+    },
+    "undocumented_assets": [".env.local (env var overrides)", ".metaflow/ (Metaflow local state)"]
+  },
+  "features": {
+    "workflow": [
+      {
+        "name": "Ingestion",
+        "description": "Per-ticker foreach step `ingest_raw` pulls news, price, fundamentals, options, insider, analyst, and macro data for configured dates, writes raw JSON files under DATA_ROOT, and persists raw tables via SQLAlchemy helpers.",
+        "entry_points": ["metaflow run: python charlie_tr1_flow.py run"],
+        "dependencies": ["charlie_fetchers", "charlie_utils.storage", "CONFIG API keys"],
+        "state": {
+          "filesystem": "raw/{source}/{ticker}/{date}/*.json manifests",
+          "database": ["charlie.raw_news", "charlie.raw_news_alt", "charlie.raw_fmp_fundamentals", "charlie.raw_eodhd_options", "charlie.insider_txn", "charlie.analyst_reco", "charlie.raw_eodhd_economic_events"],
+          "artifacts": "Metaflow artifacts per branch include manifests, normalization stats, and assembled sample IDs."
+        }
+      },
+      {
+        "name": "Normalization",
+        "description": "`normalize_dedupe` reads raw_news/_alt rows, computes content hashes, normalizes timestamps, assigns recency buckets, relevance filters, and upserts `normalized_news` with dedupe audit logging.",
+        "dependencies": ["compute_content_hash", "normalize_to_utc", "compute_bucket", "check_relevance", "write_audit", "upsert_normalized_news"],
+        "state": {"database": ["charlie.normalized_news", "charlie.audit_log"], "metrics": "Normalization stats logged per ticker."}
+      },
+      {
+        "name": "Technicals",
+        "description": "`compute_technicals` loads price windows, derives TA indicators via `compute_technical_indicators`, and upserts enriched technical JSON along with normalized files.",
+        "dependencies": ["pandas", "ta library if available", "insert_price_window"],
+        "state": {"database": ["charlie.price_window"], "filesystem": "normalized/price_window/{ticker}/{date}/technicals_*.json"}
+      },
+      {
+        "name": "Sample Assembly",
+        "description": "`assemble_samples` aggregates modalities by as_of_date, enforces quotas, composes prompt text, truncates to token budget, writes assembled prompt JSON, and inserts `assembled_sample` rows with rich sources metadata.",
+        "dependencies": ["CONFIG.ASSEMBLY_QUOTAS", "truncate_text_for_budget", "insert_assembled_sample", "storage.save_obj_and_record"],
+        "state": {"filesystem": "assembled/{ticker}/{date}/prompt_var*.json", "database": ["charlie.assembled_sample"]}
+      },
+      {
+        "name": "Labeling",
+        "description": "`generate_labels` reconstructs price series, computes forward-return quantile labels via `compute_labels_for_asset`, and upserts `sample_label` entries.",
+        "dependencies": ["pandas", "compute_labels_for_asset", "insert_sample_label"],
+        "state": {"database": ["charlie.sample_label"]}
+      },
+      {
+        "name": "LLM Distillation",
+        "description": "`distill_theses` samples assembled prompts, batches them through OpenAI with Claude fallback (`run_llm_distillation_batch`), stores thesis JSON artifacts, and persists `distilled_thesis` records.",
+        "dependencies": ["CONFIG.LLM", "run_llm_distillation_batch", "insert_distilled_thesis"],
+        "state": {"filesystem": "distilled_theses/{ticker}/thesis_sample_*.json", "database": ["charlie.distilled_thesis"]}
+      },
+      {
+        "name": "Parquet Export",
+        "description": "`export_parquet` joins assembled samples with labels and theses, validates schema, emits Snappy parquet partitions with checksum and _SUCCESS markers for downstream consumption.",
+        "dependencies": ["pandas", "sha256_hash", "CONFIG.DATA_ROOT"],
+        "state": {"filesystem": "exports/parquet/{ticker}/charlie_{ticker}_run*_*.parquet", "database": "run_meta artifacts updated"}
+      },
+      {
+        "name": "Run Finalization",
+        "description": "`join_all` aggregates artifacts from foreach branches, updates pipeline run metadata, and `end` marks run completed while refreshing materialized views.",
+        "dependencies": ["write_pipeline_run_to_db", "get_db_engine", "charlie.refresh_all_materialized_views"],
+        "state": {"database": ["charlie.pipeline_run"]}
+      }
+    ],
+    "auxiliary": {
+      "testing": "Pytest cases exercise hashing, bucket logic, relevance filters, and label algorithm ensuring helper reliability.",
+      "database_bootstrap": "`scripts/init_db.sh` applies DDL, creates performance indexes, materialized views, and refresh function with connection checks.",
+      "environment_verification": "`scripts/verify_setup.sh` confirms Python, uv, PostgreSQL availability, tests DB connectivity, and reports missing project assets."
+    }
+  },
+  "components": {
+    "metaflow_steps": {
+      "start": {
+        "responsibility": "Validate configuration, compute ticker/date ranges, prepare directories, insert pipeline_run row, fan out foreach per ticker.",
+        "inputs": {
+          "parameters": ["tickers", "start_date", "end_date", "as_of_date", "seed", "variation_count", "token_budget"],
+          "config_keys": ["DATA_ROOT", "DB_URL"]
+        },
+        "outputs": {
+          "artifacts": ["ticker_list", "date_list", "run_meta", "run_id", "raw_dir", "assembled_dir", "exports_dir"],
+          "next": "ingest_raw foreach"
+        },
+        "error_handling": "Wraps DB write in try/except, logs but continues without run_id on failure."
+      },
+      "ingest_raw": {
+        "responsibility": "Parallel ticker ingestion, API fetch, file persistence, DB inserts across modalities, manifest creation.",
+        "inputs": {
+          "props": ["self.input ticker", "date_list", "CONFIG API keys"],
+          "dependencies": ["fetch_finnhub_news", "fetch_google_news", "fetch_newsapi_alt", "fetch_yahoo_ohlcv", "fetch_fmp_fundamentals", "fetch_eodhd_options", "fetch_insider_transactions", "fetch_analyst_recommendations", "fetch_eodhd_econ_events", "fetch_edgar_filings"]
+        },
+        "state_transitions": "Creates asset if missing, populates raw tables, files, manifest path artifact.",
+        "error_handling": "Wraps each fetch block in try/except with logger.exception; fallback stubs for unimplemented sources; handles DB insert failures individually."
+      },
+      "normalize_dedupe": {
+        "responsibility": "Apply dedupe, relevance, bucket logic to populate normalized_news with audit tracking.",
+        "inputs": {
+          "props": ["asset_id", "date_list"],
+          "config": ["check_relevance heuristics"],
+          "db": "raw_news/_alt"
+        },
+        "state_transitions": "Upserts normalized rows, writes audits for duplicates/quality issues, records stats artifact.",
+        "error_handling": "Counts quality failures, logs normalization exceptions, handles duplicate key errors explicitly."
+      },
+      "compute_technicals": {
+        "responsibility": "Compute technical indicators and persist updated price windows and normalized JSON files.",
+        "inputs": {"props": ["price_window rows"]},
+        "state_transitions": "Upserts charlie.price_window technicals, writes normalized files.",
+        "error_handling": "Logs per-row failures but continues."
+      },
+      "assemble_samples": {
+        "responsibility": "Aggregate modalities, sample news, build prompt text, store assembled samples and metadata.",
+        "inputs": {
+          "props": ["CONFIG quotas", "seed", "variation_count"],
+          "db": ["price_window", "normalized_news", "raw_fmp_fundamentals", "raw_eodhd_options", "raw_eodhd_economic_events", "insider_txn", "analyst_reco"]
+        },
+        "state_transitions": "Writes prompt JSON, inserts assembled_sample rows, tracks sample IDs.",
+        "error_handling": "Catches DB fetch errors per modality, logs warnings; ensures prompt saving even if some modalities missing."
+      },
+      "generate_labels": {
+        "responsibility": "Compute forward-return quantile labels and persist sample_label rows.",
+        "inputs": {
+          "props": ["assembled_sample_ids"],
+          "db": "price_window"
+        },
+        "state_transitions": "Upserts charlie.sample_label, stores stats artifact.",
+        "error_handling": "Skips when price data absent or labels invalid; logs exceptions per sample."
+      },
+      "distill_theses": {
+        "responsibility": "Batch prompts through LLM pipeline, persist thesis outputs.",
+        "inputs": {
+          "props": ["assembled samples"],
+          "config": "CONFIG.LLM"
+        },
+        "state_transitions": "Writes thesis files, updates charlie.distilled_thesis.",
+        "error_handling": "Catch LLM failures, fall back to stub theses, logs exceptions."
+      },
+      "export_parquet": {
+        "responsibility": "Assemble final dataset, validate, export parquet, compute checksum, set success markers, update run artifacts.",
+        "inputs": {
+          "db": ["assembled_sample", "sample_label", "distilled_thesis"]
+        },
+        "state_transitions": "Writes parquet/checksum/_SUCCESS, appends to run_meta artifacts.",
+        "error_handling": "Skips export when no rows, handles missing columns, logs null counts."
+      },
+      "join_all": {
+        "responsibility": "Merge run metadata from foreach branches and finalize pipeline_run.",
+        "inputs": {"artifacts": "branch run_meta/run_id"},
+        "state_transitions": "Updates pipeline_run row with aggregated artifacts, set status success.",
+        "error_handling": "Initializes default run_meta if missing, catches aggregation errors."
+      },
+      "end": {
+        "responsibility": "Mark pipeline_run completed and refresh materialized views.",
+        "inputs": {
+          "props": ["run_id"],
+          "db": "get_db_engine"
+        },
+        "state_transitions": "Updates pipeline_run status, invokes refresh function.",
+        "error_handling": "Logs exceptions during DB update or refresh without stopping pipeline."
+      }
+    },
+    "helpers": {
+      "storage_backend": {
+        "local": "`LocalStorage` writes JSON beneath CONFIG.DATA_ROOT, ensures directories exist, and supports listing for maintenance.",
+        "s3_stub": "`S3Storage` placeholder raises NotImplementedError; indicates future S3 support path."
+      },
+      "database_helpers": {
+        "engine": "`get_db_engine` returns SQLAlchemy engine bound to CONFIG.DB_URL, enabling scoped connections in steps.",
+        "write_pipeline_run_to_db": "Inserts pipeline_run records returning run_id, used at start and join_all for audit trail.",
+        "insert_functions": "Dedicated insert/upsert helpers for each table (`insert_raw_news`, `insert_price_window`, etc.) encapsulate SQL, handle JSON serialization, and enforce idempotency via ON CONFLICT or update-first patterns.",
+        "audit": "`write_audit` records dedupe/quality actions into audit_log for traceability."
+      },
+      "fetchers": {
+        "retry_strategy": "All network fetchers decorated with tenacity retry (3 attempts, exponential backoff, optional exception filters).",
+        "rate_limiting": "Each fetch imposes `CONFIG.RATE_LIMIT_DELAY` sleep to respect vendor quotas.",
+        "provider_notes": {
+          "fetch_yahoo_ohlcv": "Uses yfinance, returns last 15 trading days, warns if empty.",
+          "fetch_finnhub_news": "Requires FINNHUB_API_KEY, maps to pipeline news schema, rate-limits, converts epoch timestamps.",
+          "fetch_newsapi_alt": "Respects NewsAPI 30-day window, logs skip if date too old.",
+          "fetch_google_news": "Calls SerpAPI, attempts flexible datetime parsing.",
+          "fetch_fmp_fundamentals": "Hits FMP v4 with fallback to v3, builds normalized payload, warns on API errors.",
+          "fetch_eodhd_options": "Skips historical requests unless same-day (premium requirement) and returns present chain.",
+          "fetch_eodhd_econ_events": "Queries economic calendar for date range and returns basic fields.",
+          "fetch_insider_transactions": "Filters future filings, maps transaction metadata.",
+          "fetch_analyst_recommendations": "Filters future dates, records rating transitions.",
+          "fetch_edgar_filings": "Stub logging placeholder for future SEC integration.",
+          "run_llm_distillation_batch": "Orchestrates OpenAI primary call per prompt with Claude fallback; returns stub theses on failure; includes heuristics to parse structured sections."
+        }
+      },
+      "data_transforms": {
+        "compute_technical_indicators": "Generates RSI, MACD, Bollinger Bands, ATR, EMA/SMA, optional Ichimoku, with safe float casting and fallback when `ta` missing.",
+        "compute_labels_for_asset": "Implements Algorithm S1: EMA3 returns, volatility normalization, weighted composite signal, asymmetric quantiles mapping to classes 1-5, returns DataFrame with signals/labels/quantiles.",
+        "compute_bucket": "Buckets articles into recency windows relative to as_of_date for prompt stratification.",
+        "check_relevance": "Heuristic requiring ticker or company name plus minimum text length to mark news as relevant."
+      }
+    }
+  },
+  "state_management": {
+    "metaflow": "FlowSpec artifacts store per-step stats, manifest paths, assembled sample IDs, and normalization metrics for run introspection.",
+    "database_tables": {
+      "asset": "Master asset registry keyed by ticker; populated lazily via `upsert_asset` during ingestion.",
+      "raw_tables": [
+        "raw_news",
+        "raw_news_alt",
+        "raw_fmp_fundamentals",
+        "raw_eodhd_options",
+        "insider_txn",
+        "analyst_reco",
+        "raw_eodhd_economic_events"
+      ],
+      "normalized_and_feature": [
+        "normalized_news",
+        "price_window",
+        "assembled_sample",
+        "sample_label",
+        "distilled_thesis"
+      ],
+      "metadata": [
+        "pipeline_run",
+        "audit_log",
+        "materialized views (label_distribution, source_summary, pipeline_run_summary, data_quality_summary)"
+      ]
+    },
+    "filesystem_layout": {
+      "root": "CONFIG.DATA_ROOT (default /opt/charlie_data)",
+      "raw": "raw/{source}/{ticker}/{date}/*.json plus manifests",
+      "normalized": "normalized/price_window/... for technicals",
+      "assembled": "assembled/{ticker}/{as_of_date}/prompt_var*.json",
+      "labels": "labels/ placeholder for future label exports",
+      "distilled_theses": "distilled_theses/{ticker}/thesis_sample_*.json",
+      "exports": "exports/parquet/{ticker}/charlie_{ticker}_run*.parquet with .sha256 and _SUCCESS"
+    },
+    "state_transitions": "Pipeline progresses from raw ingestion -> normalized dedupe -> technical enrichment -> assembled prompts -> labels -> distilled theses -> parquet exports, with each stage persisting to DB and filesystem, enabling recovery/resume via underlying tables.",
+    "selectors": "Database queries within steps filter by asset_id + as_of_date, ensuring deterministic rebuilds and enabling ad-hoc analytics via SQL or parquet outputs."
+  },
+  "infrastructure": {
+    "environment": "Config loads from .env.local via python-dotenv, enabling overrides for DB URL, data root, API keys, quotas, and LLM settings.",
+    "database_setup": "`scripts/init_db.sh` applies schema, additional indexes (GIN, hash, composite), creates materialized views and refresh function, verifies counts.",
+    "verification": "`scripts/verify_setup.sh` ensures Python3, uv, PostgreSQL availability, tests DB connectivity, reports missing key files, suggests next steps.",
+    "build_config": "pyproject uses Hatch build backend; dependencies include Metaflow, pandas, pyarrow, fastparquet, yfinance, finnhub, fredapi, openai, anthropic, Tenacity, and dev extras for linting/testing.",
+    "testing": "Tests executed via pytest (see `tests/test_charlie_pipeline.py`); CI not defined but run_test.sh expected to trigger pytest.",
+    "metaflow_requirements": "Local mode without S3 datastore; batch decorators commented out for future cloud execution."
+  },
+  "security": {
+    "secrets_handling": "API keys sourced from environment variables (FINNHUB_API_KEY, FMP_API_KEY, EODHD_API_KEY, etc.); .env.local untracked ensures credentials remain local.",
+    "network_calls": "HTTP requests dispatched over requests/yfinance clients; retries with exponential backoff mitigate transient failures.",
+    "llm_usage": "OpenAI/Anthropic keys read from CONFIG, fallback path handles unavailable providers with stub outputs to avoid leaking secrets.",
+    "data_privacy": "Raw JSON stored locally; dedupe hashes rely on SHA256; no encryption applied by default—consider securing DATA_ROOT for sensitive data."
+  },
+  "performance": {
+    "parallelism": "Metaflow `foreach` over tickers enables parallel ingestion; variation sampling uses deterministic seeds to balance load.",
+    "retry_and_resilience": "Tenacity retries protect external API calls; ingestion continues despite individual source failures via try/except guards.",
+    "batching": "LLM distillation processes prompts in configurable batches (`CONFIG.LLM.batch_size`) with optional sampling to limit costs.",
+    "database_indexes": "DDL plus init script create indexes (hash, composite, GIN) and materialized views to accelerate downstream analytics.",
+    "file_outputs": "Parquet exports compressed with Snappy; checksums provide integrity verification."
+  },
+  "testing": {
+    "unit": "`tests/test_charlie_pipeline.py` covers content hashing, bucket logic, relevance heuristics, label computation edge cases, timezone normalization, and import sanity checks.",
+    "execution": "Pytest configuration (pyproject) runs with coverage and verbose output via `python -m pytest` or `run_test.sh`."
+  },
+  "api_dependencies": {
+    "market_data": [
+      "Yahoo Finance via yfinance",
+      "Finnhub company news",
+      "Financial Modeling Prep fundamentals/insider/analyst",
+      "EODHD options & economic events",
+      "SimFin fundamentals"
+    ],
+    "news": ["SerpAPI Google News", "NewsAPI alt sources"],
+    "macro": ["FRED API"],
+    "llm_providers": ["OpenAI", "Anthropic (fallback)"],
+    "notes": "fetch_edgar_filings is stubbed and logs TODO for SEC integration; historical EODHD options require premium subscription (skipped otherwise)."
+  }
+}
+{
   "version": 1,
   "generated_at": "2025-10-19T00:00:00Z",
   "project": {

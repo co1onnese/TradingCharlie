@@ -1,0 +1,1 @@
+{"run_number": "1760930904895747", "step_name": "export_parquet", "task_id": "8", "flow_id": "CharlieTR1Pipeline", "user_name": "charlie", "tags": [], "system_tags": ["user:charlie", "metaflow_version:2.18.12", "python_version:3.12.3", "runtime:dev"], "ts_epoch": 1760930965828}

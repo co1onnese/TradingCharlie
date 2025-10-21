@@ -140,7 +140,7 @@ def validate_and_log_config():
 
     logger.info("API Configuration Status:")
     for api, available in api_status.items():
-        status = "✓ Ready" if available else "✗ Not available"
+        status = "Ready" if available else "Not available"
         logger.info(f"  {api}: {status}")
 
     if not any(api_status.values()):
