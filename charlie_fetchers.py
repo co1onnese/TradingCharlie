@@ -43,6 +43,36 @@ except ImportError:
 logger = logging.getLogger("charlie")
 
 # -------------------------
+# Helper functions
+# -------------------------
+
+def serialize_to_json_safe(obj: Any) -> Any:
+    """
+    Recursively convert an object to a JSON-serializable format.
+    Handles datetime objects, date objects, and other non-serializable types.
+    """
+    import json
+
+    def convert(item):
+        if isinstance(item, (datetime, date)):
+            return item.isoformat()
+        elif isinstance(item, dict):
+            return {k: convert(v) for k, v in item.items()}
+        elif isinstance(item, list):
+            return [convert(i) for i in item]
+        elif isinstance(item, tuple):
+            return tuple(convert(i) for i in item)
+        elif hasattr(item, '__dict__'):
+            # Handle objects with __dict__ by converting to dict
+            return convert(vars(item))
+        else:
+            # For other types, try to keep them as-is
+            # If they're not serializable, json.dumps will handle it later
+            return item
+
+    return convert(obj)
+
+# -------------------------
 # Provider fetcher implementations with retry logic
 # -------------------------
 
@@ -120,7 +150,7 @@ def fetch_finnhub_news(ticker: str, as_of_date: date, api_key: str) -> List[Dict
                 "snippet": article.get('summary', ''),
                 "url": article.get('url', ''),
                 "published_at": datetime.fromtimestamp(article.get('datetime', 0)).isoformat() if article.get('datetime') else None,
-                "raw_json": article
+                "raw_json": serialize_to_json_safe(article)
             })
 
         logger.info(f"Fetched {len(results)} news articles from Finnhub for {ticker}")
@@ -286,7 +316,7 @@ def fetch_newsapi_alt(ticker: str, as_of_date: date, api_key: str) -> List[Dict[
                 "published_at": article.get('publishedAt'),
                 "source": article.get('source', {}).get('name', 'newsapi'),
                 "language": "en",
-                "raw_json": article
+                "raw_json": serialize_to_json_safe(article)
             })
 
         logger.info(f"Fetched {len(results)} articles from NewsAPI for {ticker}")
@@ -352,31 +382,13 @@ def fetch_google_news(ticker: str, as_of_date: date, api_key: str) -> List[Dict[
                         logger.debug(f"Could not parse date: {pub_date_str}")
                         pub_date = None
 
-            # Create a copy of article for raw_json storage, ensuring no datetime objects
-            import json
-            # Convert to JSON and back to remove datetime objects
-            try:
-                raw_json_copy = json.loads(json.dumps(article, default=str))
-            except:
-                # Fallback: remove known datetime fields
-                raw_json_copy = article.copy()
-                # Remove any datetime objects recursively
-                def remove_datetimes(obj):
-                    if isinstance(obj, dict):
-                        return {k: remove_datetimes(v) for k, v in obj.items() if not isinstance(v, datetime)}
-                    elif isinstance(obj, list):
-                        return [remove_datetimes(item) for item in obj]
-                    else:
-                        return obj
-                raw_json_copy = remove_datetimes(raw_json_copy)
-
             results.append({
                 "headline": article.get('title', ''),
                 "snippet": article.get('snippet', ''),
                 "url": article.get('link', ''),
-                "published_at": pub_date,
+                "published_at": pub_date.isoformat() if pub_date else None,
                 "source": article.get('source', {}).get('name', 'google_news') if isinstance(article.get('source'), dict) else 'google_news',
-                "raw_json": raw_json_copy
+                "raw_json": serialize_to_json_safe(article)
             })
 
         logger.info(f"Fetched {len(results)} articles from Google News for {ticker}")
@@ -799,21 +811,37 @@ def _distill_with_openai(prompts: List[Dict[str, Any]], llm_config: Dict[str, An
             sample_id = p["sample_id"]
             prompt_text = p["prompt_text"]
 
-            system_prompt = """You are a financial analyst generating concise investment theses.
-Analyze the provided data and generate a structured investment thesis with:
-1. Executive Summary (2-3 sentences)
-2. Key Claims (3-5 bullet points)
-3. Supporting Evidence (cite specific data points)
-4. Risk Factors (2-3 key risks)
-5. Outlook (bullish/bearish/neutral with brief justification)
+            system_prompt = """You are a senior financial analyst generating comprehensive investment theses.
 
-Keep the response focused and data-driven."""
+CRITICAL: You have access to extensive market data including price action, news articles, financial statements, options data, macroeconomic events, insider transactions, and analyst recommendations. You MUST analyze ALL provided data comprehensively.
+
+Generate a structured investment thesis that demonstrates deep understanding of the data:
+
+1. EXECUTIVE SUMMARY (3-4 sentences synthesizing all data sources)
+
+2. PRICE & TECHNICAL ANALYSIS (analyze OHLCV data, indicators, trends)
+
+3. FUNDAMENTAL ANALYSIS (evaluate financial health using statements, ratios)
+
+4. SENTIMENT ANALYSIS (news articles, insider activity, analyst ratings, options positioning)
+
+5. MACROECONOMIC CONTEXT (relevant economic events and their impact)
+
+6. KEY INVESTMENT CLAIMS (4-6 bullet points supported by specific data)
+
+7. SUPPORTING EVIDENCE (cite concrete examples from each data modality)
+
+8. RISK FACTORS (3-4 specific risks identified from the data)
+
+9. INVESTMENT RECOMMENDATION (choose ONE: "strong_buy", "buy", "neutral", "sell", "strong_sell" with detailed justification)
+
+REQUIREMENT: Reference specific data points, dates, numbers, and sources throughout your analysis. Do not ignore any data modality. Show how multiple data sources corroborate or contradict each other."""
 
             user_prompt = f"""Based on the following financial data, generate an investment thesis:
 
 {prompt_text}
 
-Provide a structured analysis following the format specified."""
+Provide a structured analysis following the format specified. For the recommendation, choose exactly ONE from: "strong_buy", "buy", "neutral", "sell", "strong_sell"."""
 
             logger.debug(f"Generating thesis {idx+1}/{len(prompts)} for sample {sample_id}")
 
@@ -864,21 +892,37 @@ def _distill_with_claude(prompts: List[Dict[str, Any]], llm_config: Dict[str, An
             sample_id = p["sample_id"]
             prompt_text = p["prompt_text"]
 
-            system_prompt = """You are a financial analyst generating concise investment theses.
-Analyze the provided data and generate a structured investment thesis with:
-1. Executive Summary (2-3 sentences)
-2. Key Claims (3-5 bullet points)
-3. Supporting Evidence (cite specific data points)
-4. Risk Factors (2-3 key risks)
-5. Outlook (bullish/bearish/neutral with brief justification)
+            system_prompt = """You are a senior financial analyst generating comprehensive investment theses.
 
-Keep the response focused and data-driven."""
+CRITICAL: You have access to extensive market data including price action, news articles, financial statements, options data, macroeconomic events, insider transactions, and analyst recommendations. You MUST analyze ALL provided data comprehensively.
+
+Generate a structured investment thesis that demonstrates deep understanding of the data:
+
+1. EXECUTIVE SUMMARY (3-4 sentences synthesizing all data sources)
+
+2. PRICE & TECHNICAL ANALYSIS (analyze OHLCV data, indicators, trends)
+
+3. FUNDAMENTAL ANALYSIS (evaluate financial health using statements, ratios)
+
+4. SENTIMENT ANALYSIS (news articles, insider activity, analyst ratings, options positioning)
+
+5. MACROECONOMIC CONTEXT (relevant economic events and their impact)
+
+6. KEY INVESTMENT CLAIMS (4-6 bullet points supported by specific data)
+
+7. SUPPORTING EVIDENCE (cite concrete examples from each data modality)
+
+8. RISK FACTORS (3-4 specific risks identified from the data)
+
+9. INVESTMENT RECOMMENDATION (choose ONE: "strong_buy", "buy", "neutral", "sell", "strong_sell" with detailed justification)
+
+REQUIREMENT: Reference specific data points, dates, numbers, and sources throughout your analysis. Do not ignore any data modality. Show how multiple data sources corroborate or contradict each other."""
 
             user_prompt = f"""Based on the following financial data, generate an investment thesis:
 
 {prompt_text}
 
-Provide a structured analysis following the format specified."""
+Provide a structured analysis following the format specified. For the recommendation, choose exactly ONE from: "strong_buy", "buy", "neutral", "sell", "strong_sell"."""
 
             logger.debug(f"Generating thesis {idx+1}/{len(prompts)} for sample {sample_id}")
 
@@ -925,6 +969,10 @@ def _parse_thesis_structure(thesis_text: str, model: str, tokens_used: int) -> D
     summary = ""
     evidence = []
     risks = []
+    recommendation = "neutral"  # default
+
+    # Valid recommendations
+    valid_recommendations = ["strong_buy", "buy", "neutral", "sell", "strong_sell"]
 
     for i, line in enumerate(lines):
         if 'summary' in line.lower() and i + 1 < len(lines):
@@ -934,13 +982,25 @@ def _parse_thesis_structure(thesis_text: str, model: str, tokens_used: int) -> D
             evidence = [l.strip('- ') for l in lines[i+1:i+4] if l.strip().startswith('-')]
         elif 'risk' in line.lower():
             risks = [l.strip('- ') for l in lines[i+1:i+3] if l.strip().startswith('-')]
+        elif 'recommendation' in line.lower() or 'outlook' in line.lower():
+            # Look for the recommendation in the next few lines
+            for j in range(i+1, min(i+5, len(lines))):
+                line_lower = lines[j].lower().strip()
+                # Check if line contains any valid recommendation
+                for rec in valid_recommendations:
+                    if rec in line_lower or rec.replace('_', ' ') in line_lower:
+                        recommendation = rec
+                        break
+                if recommendation != "neutral":
+                    break
 
     return {
         "summary": summary or (lines[0] if lines else "No summary"),
         "claims": claims[:5] if claims else [],
         "evidence": evidence[:3] if evidence else [],
         "risks": risks[:3] if risks else [],
+        "recommendation": recommendation,
         "model": model,
         "tokens_used": tokens_used,
-        "version": "v2_structured"
+        "version": "v3_structured_5point"
     }

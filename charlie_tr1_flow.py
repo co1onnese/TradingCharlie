@@ -147,7 +147,7 @@ class CharlieTR1Pipeline(FlowSpec):
                         "url": item.get("url"),
                         "published_at": item.get("published_at"),
                         "fetched_at": datetime.utcnow(),
-                        "raw_json": item,
+                        "raw_json": item.get("raw_json"),
                         "dedupe_hash": dedupe_hash,
                         "is_relevant": None,
                         "bucket": None,
@@ -176,7 +176,7 @@ class CharlieTR1Pipeline(FlowSpec):
                         "url": item.get("url"),
                         "published_at": item.get("published_at"),
                         "fetched_at": datetime.utcnow(),
-                        "raw_json": item,
+                        "raw_json": item.get("raw_json"),
                         "dedupe_hash": dedupe_hash,
                         "is_relevant": None,
                         "bucket": None,
@@ -204,7 +204,7 @@ class CharlieTR1Pipeline(FlowSpec):
                         "published_at": item.get("published_at"),
                         "fetched_at": datetime.utcnow(),
                         "sentiment": item.get("sentiment"),
-                        "raw_json": item,
+                        "raw_json": item.get("raw_json"),
                         "dedupe_hash": dedupe,
                         "is_relevant": None,
                         "bucket": None,
@@ -769,6 +769,19 @@ class CharlieTR1Pipeline(FlowSpec):
             for var_id in range(1, int(self.variation_count) + 1):
                 random.seed(int(self.seed) + var_id + hash(f"{ticker}{as_of_date}"))
 
+                # Helper function for computing bucket from news item
+                def compute_bucket_from_item(item, as_of_date):
+                    from datetime import datetime
+                    pub_date = item.get('published_at')
+                    if isinstance(pub_date, str):
+                        try:
+                            pub_date = datetime.fromisoformat(pub_date.replace('Z', '+00:00'))
+                        except:
+                            return None
+                    elif not isinstance(pub_date, datetime):
+                        return None
+                    return compute_bucket(pub_date, as_of_date)
+
                 # Sample news per bucket respecting quotas
                 sampled_news = {}
                 news_sources = set()
@@ -780,54 +793,184 @@ class CharlieTR1Pipeline(FlowSpec):
                     total_news_count += len(sampled)
                     news_sources.update([item["source"] for item in sampled])
 
-                # Build prompt sections
+                # Build comprehensive prompt sections with ALL available data
                 prompt_parts = []
-                prompt_parts.append(f"=== INVESTMENT ANALYSIS: {ticker} ===")
+                prompt_parts.append(f"=== COMPREHENSIVE INVESTMENT ANALYSIS: {ticker} ===")
                 prompt_parts.append(f"As-of Date: {as_of_date}")
-                prompt_parts.append(f"As-of Cutoff: {as_of_cutoff}\n")
+                prompt_parts.append(f"As-of Cutoff: {as_of_cutoff}")
+                prompt_parts.append("INSTRUCTION: Analyze ALL provided data comprehensively to generate an investment thesis.")
+                prompt_parts.append("Consider price action, news sentiment, fundamentals, options market, macro events, insider activity, and analyst opinions.\n")
 
-                # Technicals
-                if technicals:
-                    prompt_parts.append("## Technical Indicators")
+                # 1. TECHNICAL ANALYSIS - Full OHLCV data and indicators
+                if technicals and ohlcv_window:
+                    prompt_parts.append("## 1. TECHNICAL ANALYSIS")
+                    prompt_parts.append(f"Price Window: {window_days} trading days")
+
+                    # Latest price data
                     latest = technicals.get("latest", {})
-                    prompt_parts.append(f"Close: ${latest.get('close', 'N/A')}")
-                    prompt_parts.append(f"RSI(14): {latest.get('rsi_14', 'N/A')}")
-                    prompt_parts.append(f"MACD: {latest.get('macd', 'N/A')}")
-                    prompt_parts.append(f"Bollinger Bands: [{latest.get('bb_lower', 'N/A')}, {latest.get('bb_upper', 'N/A')}]")
-                    prompt_parts.append(f"ATR(14): {latest.get('atr_14', 'N/A')}\n")
+                    prompt_parts.append(f"Latest Close: ${latest.get('close', 'N/A')} (Date: {latest.get('date', 'N/A')})")
 
-                # News by bucket
+                    # Key indicators
+                    prompt_parts.append("Key Indicators:")
+                    prompt_parts.append(f"- RSI(14): {latest.get('rsi_14', 'N/A')}")
+                    prompt_parts.append(f"- MACD: {latest.get('macd', 'N/A')} (Signal: {latest.get('macd_signal', 'N/A')})")
+                    prompt_parts.append(f"- Bollinger Bands: Lower={latest.get('bb_lower', 'N/A')}, Upper={latest.get('bb_upper', 'N/A')}")
+                    prompt_parts.append(f"- ATR(14): {latest.get('atr_14', 'N/A')}")
+                    prompt_parts.append(f"- EMA(20): {latest.get('ema_20', 'N/A')}, EMA(50): {latest.get('ema_50', 'N/A')}")
+
+                    # Recent OHLCV data (last 10 days for context)
+                    if ohlcv_window and len(ohlcv_window) > 0:
+                        prompt_parts.append("\nRecent Price Action (last 10 trading days):")
+                        for record in ohlcv_window[-10:]:  # Most recent 10 days
+                            prompt_parts.append(f"- {record['date']}: O={record['open']}, H={record['high']}, L={record['low']}, C={record['close']}, V={record['volume']}")
+
+                    prompt_parts.append("")  # Section separator
+
+                # 2. NEWS ANALYSIS - Full headlines and snippets
+                all_news_items = []
                 for bucket in ["0-3", "4-10", "11-30"]:
-                    items = sampled_news.get(bucket, [])
-                    if items:
-                        prompt_parts.append(f"## News ({bucket} days ago)")
-                        for item in items[:5]:  # Limit display
-                            prompt_parts.append(f"- [{item['source']}] {item['headline']}")
+                    all_news_items.extend(sampled_news.get(bucket, []))
 
-                # Fundamentals
+                if all_news_items:
+                    prompt_parts.append("## 2. NEWS ANALYSIS")
+                    prompt_parts.append(f"Total News Articles: {total_news_count} (Sources: {', '.join(news_sources)})")
+
+                    # Sort by recency (bucket priority: 0-3 > 4-10 > 11-30)
+                    bucket_priority = {"0-3": 0, "4-10": 1, "11-30": 2}
+                    sorted_news = sorted(all_news_items, key=lambda x: bucket_priority.get(compute_bucket_from_item(x, as_of_date), 3))
+
+                    # Include full content for top articles, summaries for others
+                    for i, item in enumerate(sorted_news[:15]):  # Top 15 most relevant
+                        bucket = compute_bucket_from_item(item, as_of_date)
+                        prompt_parts.append(f"[{bucket}d] {item['source']}: {item['headline']}")
+                        if item.get('snippet'):
+                            # Truncate snippet if too long, but keep meaningful content
+                            snippet = item['snippet'][:300] + "..." if len(item['snippet']) > 300 else item['snippet']
+                            prompt_parts.append(f"  \"{snippet}\"")
+                        prompt_parts.append("")
+
+                    prompt_parts.append("")  # Section separator
+
+                # 3. FUNDAMENTAL ANALYSIS - Key financial metrics
                 if fundamentals_data:
-                    prompt_parts.append("\n## Fundamentals")
-                    for fund in fundamentals_data[:2]:
+                    prompt_parts.append("## 3. FUNDAMENTAL ANALYSIS")
+                    prompt_parts.append(f"Financial Reports Available: {len(fundamentals_data)}")
+
+                    for fund in fundamentals_data[:3]:  # Top 3 most recent reports
                         prompt_parts.append(f"Report Date: {fund['report_date']} ({fund['period_type']})")
+                        data = fund.get('data', {})
 
-                # Options summary
+                        # Key metrics (prioritize most important)
+                        metrics = []
+                        if data.get('revenue'): metrics.append(f"Revenue: ${data['revenue']:,.0f}")
+                        if data.get('net_income'): metrics.append(f"Net Income: ${data['net_income']:,.0f}")
+                        if data.get('ebitda'): metrics.append(f"EBITDA: ${data['ebitda']:,.0f}")
+                        if data.get('eps'): metrics.append(f"EPS: ${data['eps']:.2f}")
+                        if data.get('gross_profit'): metrics.append(f"Gross Profit: ${data['gross_profit']:,.0f}")
+
+                        if metrics:
+                            prompt_parts.append("Key Metrics: " + " | ".join(metrics))
+                        prompt_parts.append("")
+
+                    prompt_parts.append("")  # Section separator
+
+                # 4. OPTIONS ANALYSIS - Detailed contract data
                 if options_data:
-                    prompt_parts.append(f"\n## Options (Top {len(options_data)} contracts)")
-                    prompt_parts.append(f"Avg IV: {sum(o['iv'] for o in options_data if o['iv'])/len([o for o in options_data if o['iv']]):.2f}%" if any(o['iv'] for o in options_data) else "IV: N/A")
+                    prompt_parts.append("## 4. OPTIONS ANALYSIS")
+                    prompt_parts.append(f"Options Contracts: {len(options_data)}")
 
-                # Macro
+                    # Group by expiration and type for better analysis
+                    calls = [o for o in options_data if o['type'] == 'call']
+                    puts = [o for o in options_data if o['type'] == 'put']
+
+                    if calls:
+                        prompt_parts.append(f"Call Options ({len(calls)} contracts):")
+                        # Show most relevant strikes (near current price)
+                        current_price = latest.get('close', 0) if technicals else 0
+                        if current_price:
+                            relevant_calls = sorted(calls, key=lambda x: abs(x['strike'] - current_price))[:8]
+                            for opt in relevant_calls:
+                                prompt_parts.append(f"  Strike ${opt['strike']}: OI={opt['open_interest'] or 0}, IV={opt['iv'] or 0:.2%}")
+                        else:
+                            for opt in calls[:5]:
+                                prompt_parts.append(f"  Strike ${opt['strike']}: OI={opt['open_interest'] or 0}, IV={opt['iv'] or 0:.2%}")
+
+                    if puts:
+                        prompt_parts.append(f"Put Options ({len(puts)} contracts):")
+                        if current_price:
+                            relevant_puts = sorted(puts, key=lambda x: abs(x['strike'] - current_price))[:8]
+                            for opt in relevant_puts:
+                                prompt_parts.append(f"  Strike ${opt['strike']}: OI={opt['open_interest'] or 0}, IV={opt['iv'] or 0:.2%}")
+                        else:
+                            for opt in puts[:5]:
+                                prompt_parts.append(f"  Strike ${opt['strike']}: OI={opt['open_interest'] or 0}, IV={opt['iv'] or 0:.2%}")
+
+                    # Average IV across all options
+                    all_iv = [o['iv'] for o in options_data if o.get('iv')]
+                    if all_iv:
+                        avg_iv = sum(all_iv) / len(all_iv)
+                        prompt_parts.append(f"Average Implied Volatility: {avg_iv:.2%}")
+
+                    prompt_parts.append("")  # Section separator
+
+                # 5. MACROECONOMIC CONTEXT - Complete event data
                 if macro_events:
-                    prompt_parts.append("\n## Macro Events")
-                    for event in macro_events[:3]:
-                        prompt_parts.append(f"- {event['date']}: {event['event']} ({event['importance']})")
+                    prompt_parts.append("## 5. MACROECONOMIC CONTEXT")
+                    prompt_parts.append(f"Economic Events: {len(macro_events)}")
 
-                # Insider
+                    for event in macro_events[:8]:  # Top 8 most relevant events
+                        prompt_parts.append(f"{event['date']}: {event['event']} ({event['country']})")
+                        prompt_parts.append(f"  Importance: {event['importance']}")
+                        if event.get('actual'): prompt_parts.append(f"  Actual: {event['actual']}")
+                        if event.get('forecast'): prompt_parts.append(f"  Forecast: {event['forecast']}")
+                        if event.get('previous'): prompt_parts.append(f"  Previous: {event['previous']}")
+                        prompt_parts.append("")
+
+                    prompt_parts.append("")  # Section separator
+
+                # 6. INSIDER ACTIVITY - Transaction details
                 if insider_txns:
-                    prompt_parts.append(f"\n## Insider Activity ({len(insider_txns)} transactions)")
+                    prompt_parts.append("## 6. INSIDER ACTIVITY")
+                    prompt_parts.append(f"Insider Transactions: {len(insider_txns)}")
 
-                # Analyst
+                    # Sort by recency
+                    sorted_txns = sorted(insider_txns, key=lambda x: x['date'], reverse=True)
+                    for txn in sorted_txns[:10]:  # Top 10 most recent
+                        prompt_parts.append(f"{txn['date']}: {txn['type']} - {txn.get('shares', 'N/A')} shares")
+                        if txn.get('mspr'): prompt_parts.append(f"  Price: ${txn['mspr']:.2f}")
+                        if txn.get('amount'): prompt_parts.append(f"  Value: ${txn['amount']:,.0f}")
+                        prompt_parts.append("")
+
+                    prompt_parts.append("")  # Section separator
+
+                # 7. ANALYST RECOMMENDATIONS - Rating details
                 if analyst_recos:
-                    prompt_parts.append(f"\n## Analyst Recommendations ({len(analyst_recos)} ratings)")
+                    prompt_parts.append("## 7. ANALYST RECOMMENDATIONS")
+                    prompt_parts.append(f"Analyst Ratings: {len(analyst_recos)}")
+
+                    # Group by rating
+                    rating_counts = {}
+                    for reco in analyst_recos:
+                        rating = reco.get('rating', 'Unknown')
+                        rating_counts[rating] = rating_counts.get(rating, 0) + 1
+
+                    prompt_parts.append("Rating Distribution:")
+                    for rating, count in rating_counts.items():
+                        prompt_parts.append(f"- {rating}: {count} analysts")
+
+                    # Show recent ratings
+                    sorted_recos = sorted(analyst_recos, key=lambda x: x['date'], reverse=True)
+                    prompt_parts.append("\nRecent Ratings:")
+                    for reco in sorted_recos[:5]:
+                        prompt_parts.append(f"- {reco['date']}: {reco['rating']} ({reco['firm']})")
+
+                    prompt_parts.append("")  # Section separator
+
+                # Final instruction
+                prompt_parts.append("## ANALYSIS INSTRUCTION")
+                prompt_parts.append("Generate a comprehensive investment thesis considering ALL the above data.")
+                prompt_parts.append("Analyze price trends, news sentiment, fundamental health, options market sentiment, macroeconomic factors, insider confidence, and analyst consensus.")
+                prompt_parts.append("Provide specific evidence from the data for your conclusions.")
 
                 prompt_text = "\n".join(prompt_parts)
                 truncated_text, token_count = truncate_text_for_budget(prompt_text, token_budget=int(self.token_budget))
